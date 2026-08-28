@@ -401,6 +401,35 @@
                         </div>
                     </div>
 
+                    <!-- Recent Load Balancing Card -->
+                    <div v-if="state.serviceConnected" class="status-card recent-load-card">
+                        <h3 class="card-title">{{ t("recentLoadBalancing") }}</h3>
+                        <div class="status-list">
+                            <div class="status-item">
+                                <span class="label">{{ t("activeRequests") }}</span>
+                                <span class="value">{{ state.activeRequests }}</span>
+                            </div>
+                            <div class="status-item">
+                                <span class="label">{{ t("requestsLastMinute") }}</span>
+                                <span class="value">{{ state.requestsLastMinute }}</span>
+                            </div>
+                            <div class="status-item status-item-column">
+                                <span class="label">{{ t("accountsLastMinute") }}</span>
+                                <div class="recent-account-list">
+                                    <span
+                                        v-for="account in state.accountsLastMinute"
+                                        :key="account.key"
+                                        class="recent-account-chip"
+                                    >
+                                        #{{ account.authIndex }} {{ account.accountName || "N/A" }} ·
+                                        {{ account.count }}
+                                    </span>
+                                    <span v-if="state.accountsLastMinute.length === 0" class="muted-text">-</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
                     <!-- Proxy Settings Status Card -->
                     <div v-if="state.serviceConnected" class="status-card">
                         <h3 class="card-title">
@@ -3737,7 +3766,9 @@ const state = reactive({
     accountDetails: [],
     accountLoadBalancingEnabled: false,
     accountMaxConcurrentRequests: 1,
+    accountsLastMinute: [],
     activeContextsCount: 0,
+    activeRequests: 0,
     apiKeySource: "",
     browserConnected: false,
     checkUpdateEnabled: true,
@@ -3763,6 +3794,7 @@ const state = reactive({
     maxContexts: 1,
     maxRetries: 3,
     releaseUrl: null,
+    requestsLastMinute: 0,
     safetySettingsThreshold: "OFF",
     selectedAccounts: new Set(), // Selected account indices
     serviceConnected: false,
@@ -4489,6 +4521,9 @@ const updateStatus = data => {
     state.accountDetails = data.status.accountDetails || [];
     state.accountLoadBalancingEnabled = isEnabled(data.status.accountLoadBalancing);
     state.accountMaxConcurrentRequests = data.status.accountMaxConcurrentRequests ?? 1;
+    state.activeRequests = data.status.recentLoad?.activeRequests || 0;
+    state.accountsLastMinute = data.status.recentLoad?.accounts || [];
+    state.requestsLastMinute = data.status.recentLoad?.requestsLastMinute || 0;
     state.activeContextsCount = data.status.activeContextsCount || 0;
     state.maxContexts = data.status.maxContexts ?? 1;
     state.maxRetries = data.status.maxRetries ?? 3;
@@ -5069,6 +5104,33 @@ watchEffect(() => {
 
 <style lang="less" scoped>
 @import "../styles/variables.less";
+
+.recent-load-card {
+    .status-item-column {
+        align-items: flex-start;
+        flex-direction: column;
+        gap: 0.6rem;
+    }
+
+    .recent-account-list {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.45rem;
+    }
+
+    .recent-account-chip {
+        background: rgba(var(--color-primary-rgb), 0.12);
+        border: 1px solid rgba(var(--color-primary-rgb), 0.25);
+        border-radius: 999px;
+        color: var(--text-primary);
+        font-size: 0.85rem;
+        padding: 0.25rem 0.55rem;
+    }
+
+    .muted-text {
+        color: var(--text-secondary);
+    }
+}
 
 .main-layout {
     display: flex;

@@ -1051,6 +1051,12 @@ class StatusRoutes {
                 logMaxCount: limit,
                 maxContexts: config.maxContexts,
                 maxRetries: config.maxRetries,
+                recentLoad: this.serverSystem.usageStatsService?.getRecentLoadSnapshot?.() || {
+                    accounts: [],
+                    activeRequests: 0,
+                    requestsLastMinute: 0,
+                    windowMs: 60000,
+                },
                 rotationIndicesRaw: rotationIndices,
                 safetySettingsThreshold: config.safetySettingsThreshold,
                 streamingMode: config.streamingMode,

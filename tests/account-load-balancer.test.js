@@ -150,6 +150,33 @@ test("persists and reloads the load-balancing runtime setting", async t => {
     assert.equal(await second.get("accountLoadBalancing", true), false);
 });
 
+test("computes a one-minute request and account breakdown", async () => {
+    const UsageStatsService = require("../src/core/UsageStatsService");
+    const service = new UsageStatsService(
+        {
+            accountNameMap: new Map([
+                [0, "alpha"],
+                [1, "beta"],
+            ]),
+        },
+        null,
+        "/tmp",
+        false
+    );
+    service.enabled = true;
+    const now = Date.now();
+    service.records = [
+        { finalAccountName: "alpha", finalAuthIndex: 0, finishedAt: new Date(now - 1000).toISOString() },
+        { finalAccountName: "alpha", finalAuthIndex: 0, finishedAt: new Date(now - 30000).toISOString() },
+        { finalAccountName: "beta", finalAuthIndex: 1, finishedAt: new Date(now - 70000).toISOString() },
+    ];
+    service.activeRequests = new Map([["active", {}]]);
+    const recent = service.getRecentLoadSnapshot();
+    assert.equal(recent.activeRequests, 1);
+    assert.equal(recent.requestsLastMinute, 2);
+    assert.deepEqual(recent.accounts, [{ accountName: "alpha", authIndex: 0, count: 2, key: "0:alpha" }]);
+});
+
 test("keeps the leased account isolated across concurrent async request contexts", async () => {
     const context = new AccountRequestContext();
     const observed = await Promise.all([

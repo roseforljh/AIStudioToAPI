@@ -197,6 +197,7 @@ class UsageStatsService {
             return UsageStatsService.createEmptySnapshot();
         }
 
+        const recentLoad = this.getRecentLoadSnapshot();
         const totalRequests = this.summary.totalRequests;
         const avgDurationMs = totalRequests > 0 ? Math.round(this.summary.totalDurationMs / totalRequests) : 0;
         const successRate =
@@ -228,6 +229,7 @@ class UsageStatsService {
 
         return {
             accounts,
+            recentLoad,
             // Return full request history for display and client-side filtering
             records: this.records.slice().reverse(),
             startedAt: this.startedAt,
@@ -244,6 +246,32 @@ class UsageStatsService {
                 uniqueAccountPairs: this.accountStats.size,
                 uptimeSeconds: Math.max(0, Math.floor((Date.now() - this.startedAtMs) / 1000)),
             },
+        };
+    }
+
+    getRecentLoadSnapshot(windowMs = 60000) {
+        const cutoff = Date.now() - windowMs;
+        const accounts = new Map();
+        let requestsLastMinute = 0;
+
+        for (const record of this.records) {
+            const finishedAtMs = Date.parse(record.finishedAt || record.startedAt || "");
+            if (!Number.isFinite(finishedAtMs) || finishedAtMs < cutoff) continue;
+            requestsLastMinute++;
+            const authIndex = this._normalizeAuthIndex(record.finalAuthIndex ?? record.initialAuthIndex);
+            if (authIndex === null) continue;
+            const accountName = record.finalAccountName || record.initialAccountName || null;
+            const key = this._buildAccountKey(authIndex, accountName);
+            const current = accounts.get(key) || { accountName, authIndex, count: 0, key };
+            current.count++;
+            accounts.set(key, current);
+        }
+
+        return {
+            accounts: [...accounts.values()].sort((a, b) => b.count - a.count || a.authIndex - b.authIndex),
+            activeRequests: this.activeRequests.size,
+            requestsLastMinute,
+            windowMs,
         };
     }
 
