@@ -15,6 +15,7 @@ class AccountLoadBalancer {
         }
 
         this.getEligibleAuthIndices = options.getEligibleAuthIndices;
+        this.maxConcurrentRequests = options.maxConcurrentRequests ?? null;
         this.maxConcurrentPerAccount = Math.max(1, Number(options.maxConcurrentPerAccount) || 1);
         this.acquireTimeoutMs = Math.max(1, Number(options.acquireTimeoutMs) || 30000);
         this.cooldownByStatus = new Map(
@@ -70,6 +71,26 @@ class AccountLoadBalancer {
             });
 
         return eligible.length > 0 ? eligible[0].authIndex : null;
+    }
+
+    _getGlobalConcurrencyLimit() {
+        const eligibleCount = new Set(
+            this.getEligibleAuthIndices().filter(authIndex => Number.isInteger(authIndex) && authIndex >= 0)
+        ).size;
+        if (eligibleCount === 0) return 0;
+        if (typeof this.maxConcurrentRequests === "function") {
+            return Math.max(1, Math.min(eligibleCount, Number(this.maxConcurrentRequests(eligibleCount)) || 1));
+        }
+        if (Number.isFinite(this.maxConcurrentRequests) && this.maxConcurrentRequests > 0) {
+            return Math.max(1, Math.min(eligibleCount, Math.floor(this.maxConcurrentRequests)));
+        }
+        return Math.max(1, Math.floor(eligibleCount / 2));
+    }
+
+    _getActiveRequestCount() {
+        let active = 0;
+        for (const state of this.states.values()) active += state.activeRequests;
+        return active;
     }
 
     _reserve(authIndex) {
@@ -137,7 +158,9 @@ class AccountLoadBalancer {
 
     acquire(options = {}) {
         const exclude = this._normalizeExcluded(options.exclude);
-        const authIndex = this._selectAuthIndex(exclude);
+        const globalLimit = this._getGlobalConcurrencyLimit();
+        const authIndex =
+            globalLimit > 0 && this._getActiveRequestCount() < globalLimit ? this._selectAuthIndex(exclude) : null;
         if (authIndex !== null) {
             this._reserve(authIndex);
             return Promise.resolve(this._createLease(authIndex));
@@ -187,6 +210,8 @@ class AccountLoadBalancer {
     _drainWaiters() {
         if (this.waiters.length === 0) return;
         for (const waiter of [...this.waiters]) {
+            const globalLimit = this._getGlobalConcurrencyLimit();
+            if (globalLimit <= 0 || this._getActiveRequestCount() >= globalLimit) break;
             const authIndex = this._selectAuthIndex(waiter.exclude);
             if (authIndex === null) continue;
             this._removeWaiter(waiter);
@@ -218,7 +243,11 @@ class AccountLoadBalancer {
     }
 
     getSnapshot() {
-        return [...this.states.entries()].map(([authIndex, state]) => ({ authIndex, ...state }));
+        return {
+            accounts: [...this.states.entries()].map(([authIndex, state]) => ({ authIndex, ...state })),
+            activeRequests: this._getActiveRequestCount(),
+            globalConcurrencyLimit: this._getGlobalConcurrencyLimit(),
+        };
     }
 }
 

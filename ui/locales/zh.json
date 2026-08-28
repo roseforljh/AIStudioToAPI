@@ -156,6 +156,8 @@
     "latestEntries": "最新",
     "latestVersion": "最新版本",
     "light": "亮色",
+    "loadBalancerAccounts": "账号当前负载",
+    "loadBalancerConcurrency": "负载均衡并发 / 上限",
     "loading": "加载中...",
     "log": "日志",
     "loginBtn": "登录",

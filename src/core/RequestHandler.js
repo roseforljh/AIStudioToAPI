@@ -18,6 +18,7 @@ const { QueueClosedError, QueueTimeoutError } = require("../utils/MessageQueue")
 
 const WS_RECONNECT_WAIT_MS = 130000;
 const WS_CONNECTION_READY_TIMEOUT_MS = 10000;
+const LOAD_BALANCER_INITIAL_RESPONSE_TIMEOUT_MS = 45000;
 
 // Default timeout constants (in milliseconds)
 const DEFAULT_TIMEOUTS = {
@@ -50,6 +51,7 @@ class RequestHandler {
             },
             logger,
             maxConcurrentPerAccount: config.accountMaxConcurrentRequests,
+            maxConcurrentRequests: config.accountMaxConcurrentRequestsTotal,
         });
         this.connectionRegistry.on("connectionAdded", () => this.accountLoadBalancer.notifyAvailabilityChanged());
         this.connectionRegistry.on("connectionRemoved", () => this.accountLoadBalancer.notifyAvailabilityChanged());
@@ -3347,6 +3349,9 @@ class RequestHandler {
             Number.isInteger(registeredQueueAuthIndex) && registeredQueueAuthIndex >= 0
                 ? registeredQueueAuthIndex
                 : this.currentAuthIndex;
+        const initialResponseTimeout = this.config.accountLoadBalancing
+            ? Math.min(this.timeouts.FAKE_STREAM, LOAD_BALANCER_INITIAL_RESPONSE_TIMEOUT_MS)
+            : this.timeouts.FAKE_STREAM;
         let retryAttempt = 1;
         const immediateSwitchTracker = this._createImmediateSwitchTracker(currentQueueAuthIndex);
 
@@ -3361,7 +3366,7 @@ class RequestHandler {
             try {
                 this._forwardRequest(proxyRequest, currentQueueAuthIndex);
 
-                const initialMessage = await currentQueue.dequeue(this.timeouts.FAKE_STREAM);
+                const initialMessage = await currentQueue.dequeue(initialResponseTimeout);
 
                 if (initialMessage.event_type === "timeout") {
                     throw new Error(

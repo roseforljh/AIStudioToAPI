@@ -156,6 +156,8 @@
     "latestEntries": "Latest",
     "latestVersion": "Latest Version",
     "light": "Light",
+    "loadBalancerAccounts": "Current account load",
+    "loadBalancerConcurrency": "Load-balancer concurrency / limit",
     "loading": "Loading...",
     "log": "Logs",
     "loginBtn": "Login",

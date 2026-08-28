@@ -23,6 +23,7 @@ class ConfigLoader {
             accountAcquireTimeoutMs: 30000,
             accountLoadBalancing: false,
             accountMaxConcurrentRequests: 1,
+            accountMaxConcurrentRequestsTotal: null,
             apiKeys: [],
             apiKeySource: "Not set",
             browserExecutablePath: null,
@@ -67,6 +68,12 @@ class ConfigLoader {
             config.accountAcquireTimeoutMs = Number.isFinite(parsed)
                 ? Math.max(100, parsed)
                 : config.accountAcquireTimeoutMs;
+        }
+        if (process.env.ACCOUNT_MAX_CONCURRENT_REQUESTS_TOTAL) {
+            const parsed = parseInt(process.env.ACCOUNT_MAX_CONCURRENT_REQUESTS_TOTAL, 10);
+            config.accountMaxConcurrentRequestsTotal = Number.isFinite(parsed)
+                ? Math.max(1, parsed)
+                : config.accountMaxConcurrentRequestsTotal;
         }
         if (process.env.STREAMING_MODE) config.streamingMode = process.env.STREAMING_MODE;
         if (process.env.FAILURE_THRESHOLD) {

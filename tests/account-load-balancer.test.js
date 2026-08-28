@@ -12,6 +12,7 @@ function createBalancer(options = {}) {
         cooldownByStatus: options.cooldownByStatus || { 429: 60, 503: 30 },
         getEligibleAuthIndices: () => connected,
         maxConcurrentPerAccount: options.maxConcurrentPerAccount ?? 1,
+        maxConcurrentRequests: options.maxConcurrentRequests,
         now: options.now,
     });
     return {
@@ -24,12 +25,24 @@ function createBalancer(options = {}) {
 }
 
 test("distributes concurrent leases fairly across eligible accounts", async () => {
-    const { balancer } = createBalancer();
+    const { balancer } = createBalancer({
+        acquireTimeoutMs: 100,
+        connected: [0, 1, 2],
+        maxConcurrentRequests: 3,
+    });
     const leases = await Promise.all([balancer.acquire(), balancer.acquire(), balancer.acquire()]);
     assert.deepEqual(
         leases.map(lease => lease.authIndex).sort((a, b) => a - b),
         [0, 1, 2]
     );
+    leases.forEach(lease => lease.release());
+});
+
+test("limits global concurrency to half of active accounts by default", async () => {
+    const { balancer } = createBalancer({ acquireTimeoutMs: 30, connected: [0, 1, 2, 3, 4, 5] });
+    const leases = await Promise.all([balancer.acquire(), balancer.acquire(), balancer.acquire()]);
+    assert.equal(balancer.getSnapshot().globalConcurrencyLimit, 3);
+    await assert.rejects(balancer.acquire(), error => error.code === "ACCOUNT_ACQUIRE_TIMEOUT");
     leases.forEach(lease => lease.release());
 });
 
@@ -107,7 +120,11 @@ test("preserves a status cooldown when moving has no alternative account", async
 
 test("cools down an account by status and restores it after expiry", async () => {
     let now = 1000;
-    const { balancer } = createBalancer({ connected: [0, 1], now: () => now });
+    const { balancer } = createBalancer({
+        connected: [0, 1],
+        maxConcurrentRequests: 2,
+        now: () => now,
+    });
     const first = await balancer.acquire();
     const cooled = first.authIndex;
     first.release({ status: 429 });

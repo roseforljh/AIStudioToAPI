@@ -413,6 +413,13 @@
                                 <span class="label">{{ t("requestsLastMinute") }}</span>
                                 <span class="value">{{ state.requestsLastMinute }}</span>
                             </div>
+                            <div class="status-item">
+                                <span class="label">{{ t("loadBalancerConcurrency") }}</span>
+                                <span class="value"
+                                    >{{ state.accountLoadBalancerActiveRequests }} /
+                                    {{ state.accountLoadBalancerLimit || "-" }}</span
+                                >
+                            </div>
                             <div class="status-item status-item-column">
                                 <span class="label">{{ t("accountsLastMinute") }}</span>
                                 <div class="recent-account-list">
@@ -3764,6 +3771,9 @@ const { theme, setTheme } = useTheme();
 
 const state = reactive({
     accountDetails: [],
+    accountLoadBalancerAccounts: [],
+    accountLoadBalancerActiveRequests: 0,
+    accountLoadBalancerLimit: 0,
     accountLoadBalancingEnabled: false,
     accountMaxConcurrentRequests: 1,
     accountsLastMinute: [],
@@ -4521,6 +4531,9 @@ const updateStatus = data => {
     state.accountDetails = data.status.accountDetails || [];
     state.accountLoadBalancingEnabled = isEnabled(data.status.accountLoadBalancing);
     state.accountMaxConcurrentRequests = data.status.accountMaxConcurrentRequests ?? 1;
+    state.accountLoadBalancerActiveRequests = data.status.loadBalancer?.activeRequests || 0;
+    state.accountLoadBalancerLimit = data.status.loadBalancer?.globalConcurrencyLimit || 0;
+    state.accountLoadBalancerAccounts = data.status.loadBalancer?.accounts || [];
     state.activeRequests = data.status.recentLoad?.activeRequests || 0;
     state.accountsLastMinute = data.status.recentLoad?.accounts || [];
     state.requestsLastMinute = data.status.recentLoad?.requestsLastMinute || 0;
