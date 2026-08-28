@@ -8,6 +8,8 @@
     "accountDedupSuccess": "Deduplication completed. Deleted: {removedIndices}",
     "accountDedupSwitchFailed": "Failed to switch to latest auth before deduplication: {reason}",
     "accountDeleteSuccess": "Account #{index} deleted successfully.",
+    "accountLoadBalancing": "Account load balancing",
+    "accountLoadBalancingDescription": "Distribute requests across accounts, up to {count} concurrent request(s) per account",
     "accountManagement": "Account Management",
     "accountStatus": "Account Status",
     "accountSwitchCancelledSingle": "Switch cancelled: Only one available account.",

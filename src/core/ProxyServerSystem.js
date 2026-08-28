@@ -22,6 +22,7 @@ const ConnectionRegistry = require("./ConnectionRegistry");
 const RequestHandler = require("./RequestHandler");
 const UsageStatsService = require("./UsageStatsService");
 const ConfigLoader = require("../utils/ConfigLoader");
+const RuntimeSettingsStore = require("../utils/RuntimeSettingsStore");
 const WebRoutes = require("../routes/WebRoutes");
 
 /**
@@ -35,6 +36,7 @@ class ProxyServerSystem extends EventEmitter {
 
         const configLoader = new ConfigLoader(this.logger);
         this.config = configLoader.loadConfiguration();
+        this.runtimeSettingsStore = new RuntimeSettingsStore();
 
         this.authSource = new AuthSource(this.logger);
         this.browserManager = new BrowserManager(this.logger, this.config, this.authSource);
@@ -115,6 +117,11 @@ class ProxyServerSystem extends EventEmitter {
     }
 
     async start(initialAuthIndex = null) {
+        this.config.accountLoadBalancing = await this.runtimeSettingsStore.get(
+            "accountLoadBalancing",
+            this.config.accountLoadBalancing
+        );
+        this.logger.info(`[System] Runtime account load balancing: ${this.config.accountLoadBalancing}`);
         this.logger.info("[System] Starting flexible startup process...");
         await this._startHttpServer();
         await this._startWebSocketServer();

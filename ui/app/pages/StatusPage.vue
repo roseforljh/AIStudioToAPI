@@ -1163,6 +1163,44 @@
                                         stroke-linejoin="round"
                                         style="margin-right: 6px; vertical-align: middle"
                                     >
+                                        <circle cx="6" cy="12" r="3"></circle>
+                                        <circle cx="18" cy="6" r="3"></circle>
+                                        <circle cx="18" cy="18" r="3"></circle>
+                                        <path d="M8.6 10.5l6.8-3"></path>
+                                        <path d="M8.6 13.5l6.8 3"></path>
+                                    </svg>
+                                    <span>
+                                        {{ t("accountLoadBalancing") }}
+                                        <EnvVarTooltip env-var="ACCOUNT_LOAD_BALANCING" doc-section="proxy-config" />
+                                        <small class="setting-description">
+                                            {{
+                                                t("accountLoadBalancingDescription", {
+                                                    count: state.accountMaxConcurrentRequests,
+                                                })
+                                            }}
+                                        </small>
+                                    </span>
+                                </span>
+                                <el-switch
+                                    v-model="state.accountLoadBalancingEnabled"
+                                    :width="50"
+                                    :before-change="handleAccountLoadBalancingBeforeChange"
+                                />
+                            </div>
+                            <div class="switch-container">
+                                <span class="label">
+                                    <svg
+                                        xmlns="http://www.w3.org/2000/svg"
+                                        width="14"
+                                        height="14"
+                                        viewBox="0 0 24 24"
+                                        fill="none"
+                                        stroke="currentColor"
+                                        stroke-width="2"
+                                        stroke-linecap="round"
+                                        stroke-linejoin="round"
+                                        style="margin-right: 6px; vertical-align: middle"
+                                    >
                                         <path d="M21 12a9 9 0 1 1-9-9"></path>
                                         <path d="M21 3v9h-9"></path>
                                     </svg>
@@ -3697,6 +3735,8 @@ const { theme, setTheme } = useTheme();
 
 const state = reactive({
     accountDetails: [],
+    accountLoadBalancingEnabled: false,
+    accountMaxConcurrentRequests: 1,
     activeContextsCount: 0,
     apiKeySource: "",
     browserConnected: false,
@@ -4199,6 +4239,8 @@ const handleForceCodeExecutionBeforeChange = () =>
     handleSettingChange("/api/settings/force-code-execution", "forceCodeExecution");
 
 const handleForceWebSearchBeforeChange = () => handleSettingChange("/api/settings/force-web-search", "forceWebSearch");
+const handleAccountLoadBalancingBeforeChange = () =>
+    handleSettingChange("/api/settings/account-load-balancing", "accountLoadBalancing");
 const handleCheckUpdateBeforeChange = () => handleSettingChange("/api/settings/check-update", "checkUpdate");
 const handleEnableAuthUpdateBeforeChange = () =>
     handleSettingChange("/api/settings/enable-auth-update", "enableAuthUpdate");
@@ -4445,6 +4487,8 @@ const updateStatus = data => {
     state.debugModeEnabled = isEnabled(data.status.debugMode);
     state.currentAuthIndex = data.status.currentAuthIndex;
     state.accountDetails = data.status.accountDetails || [];
+    state.accountLoadBalancingEnabled = isEnabled(data.status.accountLoadBalancing);
+    state.accountMaxConcurrentRequests = data.status.accountMaxConcurrentRequests ?? 1;
     state.activeContextsCount = data.status.activeContextsCount || 0;
     state.maxContexts = data.status.maxContexts ?? 1;
     state.maxRetries = data.status.maxRetries ?? 3;

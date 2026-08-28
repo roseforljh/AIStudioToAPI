@@ -3,6 +3,7 @@ const test = require("node:test");
 
 const AccountLoadBalancer = require("../src/core/AccountLoadBalancer");
 const AccountRequestContext = require("../src/core/AccountRequestContext");
+const RuntimeSettingsStore = require("../src/utils/RuntimeSettingsStore");
 
 function createBalancer(options = {}) {
     let connected = options.connected || [0, 1, 2];
@@ -132,6 +133,21 @@ test("release is idempotent", async () => {
     const next = await balancer.acquire();
     assert.equal(next.authIndex, 0);
     next.release();
+});
+
+test("persists and reloads the load-balancing runtime setting", async t => {
+    const fs = require("node:fs/promises");
+    const os = require("node:os");
+    const path = require("node:path");
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "aistudio-settings-"));
+    t.after(() => fs.rm(directory, { force: true, recursive: true }));
+    const filePath = path.join(directory, "runtime-settings.json");
+
+    const first = new RuntimeSettingsStore(filePath);
+    await first.set("accountLoadBalancing", false);
+
+    const second = new RuntimeSettingsStore(filePath);
+    assert.equal(await second.get("accountLoadBalancing", true), false);
 });
 
 test("keeps the leased account isolated across concurrent async request contexts", async () => {

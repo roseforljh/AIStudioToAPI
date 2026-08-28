@@ -699,6 +699,26 @@ class StatusRoutes {
             }
         });
 
+        app.put("/api/settings/account-load-balancing", isAuthenticated, async (req, res) => {
+            const requestedValue = req.body?.enabled;
+            const newValue = typeof requestedValue === "boolean" ? requestedValue : !this.config.accountLoadBalancing;
+            this.config.accountLoadBalancing = newValue;
+            this.serverSystem.requestHandler.accountLoadBalancer.notifyAvailabilityChanged();
+            try {
+                await this.serverSystem.runtimeSettingsStore.set("accountLoadBalancing", newValue);
+                this.logger.info(`[WebUI] Account load balancing switched to: ${newValue}`);
+                return res.status(200).json({
+                    message: "settingUpdateSuccess",
+                    setting: "accountLoadBalancing",
+                    value: newValue,
+                });
+            } catch (error) {
+                this.config.accountLoadBalancing = !newValue;
+                this.logger.error(`[WebUI] Failed to persist account load balancing: ${error.message}`);
+                return res.status(500).json({ error: error.message, message: "settingFailed" });
+            }
+        });
+
         app.put("/api/settings/streaming-mode", isAuthenticated, (req, res) => {
             const newMode = req.body.mode;
             if (newMode === "fake" || newMode === "real") {
@@ -1004,6 +1024,8 @@ class StatusRoutes {
             logs: displayLogs.join("\n"),
             status: {
                 accountDetails,
+                accountLoadBalancing: config.accountLoadBalancing,
+                accountMaxConcurrentRequests: config.accountMaxConcurrentRequests,
                 activeContextsCount: browserManager.contexts.size,
                 apiKeySource: config.apiKeySource,
                 browserConnected: !!this.serverSystem.connectionRegistry.getConnectionByAuth(currentAuthIndex, false),

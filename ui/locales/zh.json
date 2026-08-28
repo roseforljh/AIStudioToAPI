@@ -8,6 +8,8 @@
     "accountDedupSuccess": "去重清理完成，已删除：{removedIndices}",
     "accountDedupSwitchFailed": "去重前切换到最新 auth 失败：{reason}",
     "accountDeleteSuccess": "账号 {index} 删除成功。",
+    "accountLoadBalancing": "账号负载均衡",
+    "accountLoadBalancingDescription": "按账号分流，每个账号最多 {count} 个并发请求",
     "accountManagement": "账号管理",
     "accountStatus": "账号状态",
     "accountSwitchCancelledSingle": "切换取消：只有一个可用账号。",
