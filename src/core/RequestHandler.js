@@ -19,6 +19,7 @@ const { QueueClosedError, QueueTimeoutError } = require("../utils/MessageQueue")
 const WS_RECONNECT_WAIT_MS = 130000;
 const WS_CONNECTION_READY_TIMEOUT_MS = 10000;
 const LOAD_BALANCER_INITIAL_RESPONSE_TIMEOUT_MS = 45000;
+const LOAD_BALANCER_TOTAL_REQUEST_TIMEOUT_MS = 120000;
 
 // Default timeout constants (in milliseconds)
 const DEFAULT_TIMEOUTS = {
@@ -3343,6 +3344,9 @@ class RequestHandler {
     async _executeRequestWithRetries(proxyRequest, messageQueue) {
         let lastError = null;
         let currentQueue = messageQueue;
+        const totalDeadline = this.config.accountLoadBalancing
+            ? Date.now() + LOAD_BALANCER_TOTAL_REQUEST_TIMEOUT_MS
+            : null;
         const registeredQueueAuthIndex = this.connectionRegistry.getAuthIndexForRequest(proxyRequest.request_id);
         // Track the authIndex registered for the current queue, which may differ from the global current account.
         let currentQueueAuthIndex =
@@ -3356,6 +3360,10 @@ class RequestHandler {
         const immediateSwitchTracker = this._createImmediateSwitchTracker(currentQueueAuthIndex);
 
         while (retryAttempt <= this.config.maxRetries) {
+            if (totalDeadline !== null && Date.now() >= totalDeadline) {
+                lastError = { message: "Load-balancer request deadline exceeded.", status: 504 };
+                break;
+            }
             // Record attempt at the start of each retry, before forwarding.
             // This ensures failed attempts (e.g. 429 before any response) are also counted.
             this._getUsageStatsService()?.recordAttempt(
@@ -3471,6 +3479,9 @@ class RequestHandler {
                     break;
                 }
 
+                if (this.config.accountLoadBalancing && this.accountRequestContext.getLease()) {
+                    this.accountLoadBalancer.markCooldown(currentQueueAuthIndex, 504, 15000);
+                }
                 lastError = errorPayload;
                 this._cancelCurrentAttemptBeforeRetry(proxyRequest, currentQueueAuthIndex);
 
