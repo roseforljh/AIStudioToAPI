@@ -482,32 +482,44 @@ class ProxyServerSystem extends EventEmitter {
             res.status(200).json({ models: this.config.modelList });
         });
 
-        app.post("/v1/chat/completions", (req, res) => {
-            this.requestHandler.processOpenAIRequest(req, res);
+        app.post("/v1/chat/completions", async (req, res) => {
+            await this.requestHandler._withAccountLease(req, res, () =>
+                this.requestHandler.processOpenAIRequest(req, res)
+            );
         });
 
-        app.post(["/v1/embeddings", "/v1/openai/embeddings"], (req, res) => {
-            this.requestHandler.processOpenAIEmbeddingsRequest(req, res);
+        app.post(["/v1/embeddings", "/v1/openai/embeddings"], async (req, res) => {
+            await this.requestHandler._withAccountLease(req, res, () =>
+                this.requestHandler.processOpenAIEmbeddingsRequest(req, res)
+            );
         });
 
         // OpenAI Response API compatible endpoint
-        app.post("/v1/responses", (req, res) => {
-            this.requestHandler.processOpenAIResponseRequest(req, res);
+        app.post("/v1/responses", async (req, res) => {
+            await this.requestHandler._withAccountLease(req, res, () =>
+                this.requestHandler.processOpenAIResponseRequest(req, res)
+            );
         });
 
         // OpenAI Response API count input tokens endpoint
-        app.post(["/v1/responses/input_tokens", "/responses/input_tokens"], (req, res) => {
-            this.requestHandler.processOpenAIResponseInputTokens(req, res);
+        app.post(["/v1/responses/input_tokens", "/responses/input_tokens"], async (req, res) => {
+            await this.requestHandler._withAccountLease(req, res, () =>
+                this.requestHandler.processOpenAIResponseInputTokens(req, res)
+            );
         });
 
         // Claude API compatible endpoint
-        app.post("/v1/messages", (req, res) => {
-            this.requestHandler.processClaudeRequest(req, res);
+        app.post("/v1/messages", async (req, res) => {
+            await this.requestHandler._withAccountLease(req, res, () =>
+                this.requestHandler.processClaudeRequest(req, res)
+            );
         });
 
         // Claude API count tokens endpoint
-        app.post("/v1/messages/count_tokens", (req, res) => {
-            this.requestHandler.processClaudeCountTokens(req, res);
+        app.post("/v1/messages/count_tokens", async (req, res) => {
+            await this.requestHandler._withAccountLease(req, res, () =>
+                this.requestHandler.processClaudeCountTokens(req, res)
+            );
         });
 
         // VNC WebSocket downgrade / missing headers handler
@@ -522,12 +534,14 @@ class ProxyServerSystem extends EventEmitter {
 
         // File Upload Routes
         // Intercept upload requests to use specialized handler
-        app.all(/\/upload\/.*/, (req, res) => {
-            this.requestHandler.processUploadRequest(req, res);
+        app.all(/\/upload\/.*/, async (req, res) => {
+            await this.requestHandler._withAccountLease(req, res, () =>
+                this.requestHandler.processUploadRequest(req, res)
+            );
         });
 
-        app.all(/(.*)/, (req, res) => {
-            this.requestHandler.processRequest(req, res);
+        app.all(/(.*)/, async (req, res) => {
+            await this.requestHandler._withAccountLease(req, res, () => this.requestHandler.processRequest(req, res));
         });
 
         return app;

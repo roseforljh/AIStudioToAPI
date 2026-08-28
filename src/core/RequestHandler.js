@@ -11,6 +11,8 @@
  */
 const AuthSwitcher = require("../auth/AuthSwitcher");
 const FormatConverter = require("./FormatConverter");
+const AccountLoadBalancer = require("./AccountLoadBalancer");
+const AccountRequestContext = require("./AccountRequestContext");
 const { isUserAbortedError } = require("../utils/CustomErrors");
 const { QueueClosedError, QueueTimeoutError } = require("../utils/MessageQueue");
 
@@ -35,6 +37,22 @@ class RequestHandler {
         // Initialize sub-modules
         this.authSwitcher = new AuthSwitcher(logger, config, authSource, browserManager);
         this.formatConverter = new FormatConverter(logger, serverSystem);
+        this.accountRequestContext = new AccountRequestContext();
+        this.accountLoadBalancer = new AccountLoadBalancer({
+            acquireTimeoutMs: config.accountAcquireTimeoutMs,
+            cooldownByStatus: { 429: 60000, 503: 30000 },
+            getEligibleAuthIndices: () => {
+                if (!config.accountLoadBalancing) return [this.authSwitcher.currentAuthIndex];
+                return [...this.connectionRegistry.getAllConnections().entries()]
+                    .filter(([, connection]) => connection?.readyState === 1)
+                    .map(([authIndex]) => authIndex)
+                    .filter(authIndex => this.browserManager.contexts.has(authIndex));
+            },
+            logger,
+            maxConcurrentPerAccount: config.accountMaxConcurrentRequests,
+        });
+        this.connectionRegistry.on("connectionAdded", () => this.accountLoadBalancer.notifyAvailabilityChanged());
+        this.connectionRegistry.on("connectionRemoved", () => this.accountLoadBalancer.notifyAvailabilityChanged());
 
         this.needsSwitchingAfterRequest = false;
 
@@ -47,7 +65,10 @@ class RequestHandler {
 
     // Delegate properties to AuthSwitcher
     get currentAuthIndex() {
-        return this.authSwitcher.currentAuthIndex;
+        return (
+            this.accountRequestContext?.getAuthIndex(this.authSwitcher.currentAuthIndex) ??
+            this.authSwitcher.currentAuthIndex
+        );
     }
 
     get failureCount() {
@@ -229,6 +250,61 @@ class RequestHandler {
         this._markTrackedResponseError(res, message, statusCode);
     }
 
+    async _withAccountLease(req, res, callback) {
+        if (!this.config.accountLoadBalancing || this.accountRequestContext.getLease()) {
+            return callback();
+        }
+
+        const controller = new AbortController();
+        const abort = () => controller.abort();
+        req.once("aborted", abort);
+        res.once("close", abort);
+        let lease;
+        try {
+            lease = await this.accountLoadBalancer.acquire({ signal: controller.signal });
+            const assignedAuthIndex = lease.authIndex;
+            if (
+                !this.browserManager.contexts.has(assignedAuthIndex) ||
+                this.connectionRegistry.getConnectionByAuth(assignedAuthIndex, false)?.readyState !== 1
+            ) {
+                lease.release();
+                lease = null;
+                this.accountLoadBalancer.notifyAvailabilityChanged();
+                throw new Error(`Assigned account #${assignedAuthIndex} became unavailable before request start.`);
+            }
+            this.logger.info(
+                `[LoadBalancer] Assigned request ${req.method} ${req.path} to account #${lease.authIndex}`
+            );
+            return await this.accountRequestContext.run({ lease }, callback);
+        } catch (error) {
+            if (!res.headersSent && !res.writableEnded) {
+                if (error.name === "AbortError") return;
+                this._sendErrorResponse(res, 503, "No account slot became available before timeout.");
+            }
+            return undefined;
+        } finally {
+            req.off("aborted", abort);
+            res.off("close", abort);
+            lease?.release();
+        }
+    }
+
+    async _moveCurrentAccountLease(errorDetails, attemptedAuthIndices) {
+        const lease = this.accountRequestContext.getLease();
+        if (!lease) return false;
+        const sourceAuthIndex = lease.authIndex;
+        attemptedAuthIndices.add(sourceAuthIndex);
+        await lease.move({
+            exclude: attemptedAuthIndices,
+            release: { status: Number(errorDetails?.status) },
+        });
+        attemptedAuthIndices.add(lease.authIndex);
+        this.logger.warn(
+            `[LoadBalancer] Retrying request on account #${lease.authIndex} after account #${sourceAuthIndex} returned ${errorDetails?.status || "an error"}`
+        );
+        return true;
+    }
+
     // Delegate methods to AuthSwitcher
     async _switchToNextAuth() {
         return this.authSwitcher.switchToNextAuth();
@@ -241,7 +317,10 @@ class RequestHandler {
     async _waitForGraceReconnect(timeoutMs = WS_RECONNECT_WAIT_MS) {
         const start = Date.now();
         while (Date.now() - start < timeoutMs) {
-            if (!this.connectionRegistry.isInGracePeriod() && !this.connectionRegistry.isReconnectingInProgress()) {
+            if (
+                !this.connectionRegistry.isInGracePeriod(this.currentAuthIndex) &&
+                !this.connectionRegistry.isReconnectingInProgress(this.currentAuthIndex)
+            ) {
                 const connectionReady = await this._waitForConnection(WS_CONNECTION_READY_TIMEOUT_MS);
                 return connectionReady;
             }
@@ -652,11 +731,30 @@ class RequestHandler {
         return `immediate_status_retry_${status}`;
     }
 
+    async _handleRequestFailure(errorDetails, sendErrorCallback = null) {
+        if (this.config.accountLoadBalancing && this.accountRequestContext.getLease()) {
+            const status = Number(errorDetails?.status);
+            if (this.config.immediateSwitchStatusCodes.includes(status)) {
+                this.accountLoadBalancer.markCooldown(this.currentAuthIndex, status);
+            }
+            return;
+        }
+        return this.authSwitcher.handleRequestFailureAndSwitch(errorDetails, sendErrorCallback);
+    }
+
     async _performImmediateSwitchRetry(errorDetails, requestId, tracker) {
-        await this.authSwitcher.handleRequestFailureAndSwitch(
-            { message: errorDetails.message, status: Number(errorDetails.status) },
-            null
-        );
+        if (this.config.accountLoadBalancing && this.accountRequestContext.getLease()) {
+            try {
+                return await this._moveCurrentAccountLease(errorDetails, tracker.attemptedAuthIndices);
+            } catch (error) {
+                this.logger.warn(
+                    `[LoadBalancer] No alternative account available for request #${requestId}: ${error.message}`
+                );
+                return false;
+            }
+        }
+
+        await this._handleRequestFailure({ message: errorDetails.message, status: Number(errorDetails.status) }, null);
 
         const ready = await this._waitForSystemAndConnectionIfBusy(null, {
             sendError: () => {},
@@ -751,7 +849,10 @@ class RequestHandler {
      */
     async _handleBrowserRecovery(res) {
         // If within grace period or lightweight reconnect is running, wait up to 130s for WebSocket reconnection
-        if (this.connectionRegistry.isInGracePeriod() || this.connectionRegistry.isReconnectingInProgress()) {
+        if (
+            this.connectionRegistry.isInGracePeriod(this.currentAuthIndex) ||
+            this.connectionRegistry.isReconnectingInProgress(this.currentAuthIndex)
+        ) {
             this.logger.info(
                 "[System] Waiting up to 130s for WebSocket reconnection (grace/reconnect in progress) before full recovery..."
             );
@@ -761,6 +862,13 @@ class RequestHandler {
                 return true;
             }
             this.logger.warn("[System] Reconnection wait expired, proceeding to recovery workflow.");
+        }
+
+        if (this.config.accountLoadBalancing && this.accountRequestContext.getLease()) {
+            this.logger.warn(
+                `[LoadBalancer] Account #${this.currentAuthIndex} is unavailable; skipping global browser/account switching recovery.`
+            );
+            return false;
         }
 
         // Wait for system to become ready if it's busy (someone else is starting/switching browser)
@@ -907,8 +1015,8 @@ class RequestHandler {
                 req.method === "POST" &&
                 (req.path.includes("generateContent") || req.path.includes("streamGenerateContent"));
 
-            if (isGenerativeRequest) {
-                const usageCount = this.authSwitcher.incrementUsageCount();
+            if (isGenerativeRequest && !this.config.accountLoadBalancing) {
+                const usageCount = this.config.accountLoadBalancing ? 0 : this.authSwitcher.incrementUsageCount();
                 if (usageCount > 0) {
                     const rotationCountText =
                         this.config.switchOnUses > 0 ? `${usageCount}/${this.config.switchOnUses}` : `${usageCount}`;
@@ -965,7 +1073,7 @@ class RequestHandler {
                 this._handleRequestError(error, res, requestId);
             } finally {
                 this.connectionRegistry.removeMessageQueue(requestId, "request_complete");
-                if (this.needsSwitchingAfterRequest) {
+                if (!this.config.accountLoadBalancing && this.needsSwitchingAfterRequest) {
                     this.logger.info(
                         `[Auth] Rotation count reached switching threshold (${this.authSwitcher.usageCount}/${this.config.switchOnUses}), will automatically switch account in background...`
                     );
@@ -1151,7 +1259,7 @@ class RequestHandler {
             const systemStreamMode = this.config.streamingMode;
 
             // Handle usage counting
-            const usageCount = this.authSwitcher.incrementUsageCount();
+            const usageCount = this.config.accountLoadBalancing ? 0 : this.authSwitcher.incrementUsageCount();
             if (usageCount > 0) {
                 const rotationCountText =
                     this.config.switchOnUses > 0 ? `${usageCount}/${this.config.switchOnUses}` : `${usageCount}`;
@@ -1278,7 +1386,7 @@ class RequestHandler {
 
                         // Avoid switching account if the error is just a connection reset
                         if (!skipFinalFailureSwitch && !this._isConnectionResetError(initialMessage)) {
-                            await this.authSwitcher.handleRequestFailureAndSwitch(initialMessage, null);
+                            await this._handleRequestFailure(initialMessage, null);
                         } else if (skipFinalFailureSwitch) {
                             this.logger.info(
                                 "[Request] Immediate-switch retries exhausted, skipping additional account switch."
@@ -1345,7 +1453,7 @@ class RequestHandler {
 
                             // Avoid switching account if the error is just a connection reset
                             if (!result.error.skipAccountSwitch && !this._isConnectionResetError(result.error)) {
-                                await this.authSwitcher.handleRequestFailureAndSwitch(result.error, null);
+                                await this._handleRequestFailure(result.error, null);
                             } else if (result.error.skipAccountSwitch) {
                                 this.logger.info(
                                     "[Request] Immediate-switch retries exhausted, skipping additional account switch."
@@ -1462,7 +1570,7 @@ class RequestHandler {
                 this._handleRequestError(error, res, requestId);
             } finally {
                 this.connectionRegistry.removeMessageQueue(requestId, "request_complete");
-                if (this.needsSwitchingAfterRequest) {
+                if (!this.config.accountLoadBalancing && this.needsSwitchingAfterRequest) {
                     this.logger.info(
                         `[Auth] Rotation count reached switching threshold (${this.authSwitcher.usageCount}/${this.config.switchOnUses}), will automatically switch account in background...`
                     );
@@ -1548,7 +1656,7 @@ class RequestHandler {
             const systemStreamMode = this.config.streamingMode;
 
             // Handle usage counting
-            const usageCount = this.authSwitcher.incrementUsageCount();
+            const usageCount = this.config.accountLoadBalancing ? 0 : this.authSwitcher.incrementUsageCount();
             if (usageCount > 0) {
                 const rotationCountText =
                     this.config.switchOnUses > 0 ? `${usageCount}/${this.config.switchOnUses}` : `${usageCount}`;
@@ -1681,7 +1789,7 @@ class RequestHandler {
 
                         // Avoid switching account if the error is just a connection reset
                         if (!skipFinalFailureSwitch && !this._isConnectionResetError(initialMessage)) {
-                            await this.authSwitcher.handleRequestFailureAndSwitch(initialMessage, null);
+                            await this._handleRequestFailure(initialMessage, null);
                         } else if (skipFinalFailureSwitch) {
                             this.logger.info(
                                 "[Request] Immediate-switch retries exhausted, skipping additional account switch."
@@ -1755,7 +1863,7 @@ class RequestHandler {
 
                             // Avoid switching account if the error is just a connection reset
                             if (!result.error.skipAccountSwitch && !this._isConnectionResetError(result.error)) {
-                                await this.authSwitcher.handleRequestFailureAndSwitch(result.error, null);
+                                await this._handleRequestFailure(result.error, null);
                             } else if (result.error.skipAccountSwitch) {
                                 this.logger.info(
                                     "[Request] Immediate-switch retries exhausted, skipping additional account switch."
@@ -1888,7 +1996,7 @@ class RequestHandler {
                 this._handleRequestError(error, res, requestId);
             } finally {
                 this.connectionRegistry.removeMessageQueue(requestId, "request_complete");
-                if (this.needsSwitchingAfterRequest) {
+                if (!this.config.accountLoadBalancing && this.needsSwitchingAfterRequest) {
                     this.logger.info(
                         `[Auth] Rotation count reached switching threshold (${this.authSwitcher.usageCount}/${this.config.switchOnUses}), will automatically switch account in background...`
                     );
@@ -1925,7 +2033,7 @@ class RequestHandler {
             const systemStreamMode = this.config.streamingMode;
 
             // Handle usage counting
-            const usageCount = this.authSwitcher.incrementUsageCount();
+            const usageCount = this.config.accountLoadBalancing ? 0 : this.authSwitcher.incrementUsageCount();
             if (usageCount > 0) {
                 const rotationCountText =
                     this.config.switchOnUses > 0 ? `${usageCount}/${this.config.switchOnUses}` : `${usageCount}`;
@@ -2049,7 +2157,7 @@ class RequestHandler {
                         });
                         this._sendErrorResponse(res, initialMessage.status || 500, initialMessage.message, "api_error");
                         if (!skipFinalFailureSwitch && !this._isConnectionResetError(initialMessage)) {
-                            await this.authSwitcher.handleRequestFailureAndSwitch(initialMessage, null);
+                            await this._handleRequestFailure(initialMessage, null);
                         } else if (skipFinalFailureSwitch) {
                             this.logger.info(
                                 "[Request] Immediate-switch retries exhausted, skipping additional account switch."
@@ -2111,7 +2219,7 @@ class RequestHandler {
                                 );
                             }
                             if (!result.error.skipAccountSwitch && !this._isConnectionResetError(result.error)) {
-                                await this.authSwitcher.handleRequestFailureAndSwitch(result.error, null);
+                                await this._handleRequestFailure(result.error, null);
                             } else if (result.error.skipAccountSwitch) {
                                 this.logger.info(
                                     "[Request] Immediate-switch retries exhausted, skipping additional account switch."
@@ -2226,7 +2334,7 @@ class RequestHandler {
                 this._handleRequestError(error, res, requestId);
             } finally {
                 this.connectionRegistry.removeMessageQueue(requestId, "request_complete");
-                if (this.needsSwitchingAfterRequest) {
+                if (!this.config.accountLoadBalancing && this.needsSwitchingAfterRequest) {
                     this.logger.info(
                         `[Auth] Rotation count reached switching threshold (${this.authSwitcher.usageCount}/${this.config.switchOnUses}), will automatically switch account in background...`
                     );
@@ -2324,7 +2432,7 @@ class RequestHandler {
                     );
                     this._sendErrorResponse(res, response.status || 500, response.message, "api_error");
                     if (!this._isConnectionResetError(response)) {
-                        await this.authSwitcher.handleRequestFailureAndSwitch(response, null);
+                        await this._handleRequestFailure(response, null);
                     }
                     return;
                 }
@@ -2468,7 +2576,7 @@ class RequestHandler {
 
                     // Avoid switching account if the error is just a connection reset
                     if (!this._isConnectionResetError(response)) {
-                        await this.authSwitcher.handleRequestFailureAndSwitch(response, null);
+                        await this._handleRequestFailure(response, null);
                     } else {
                         this.logger.info(
                             "[Request] Failure due to connection reset (input_tokens), skipping account switch."
@@ -2695,7 +2803,7 @@ class RequestHandler {
 
                     // Avoid switching account if the error is just a connection reset
                     if (!result.error.skipAccountSwitch && !this._isConnectionResetError(result.error)) {
-                        await this.authSwitcher.handleRequestFailureAndSwitch(result.error, null);
+                        await this._handleRequestFailure(result.error, null);
                     } else if (result.error.skipAccountSwitch) {
                         this.logger.info(
                             "[Request] Immediate-switch retries exhausted, skipping additional account switch."
@@ -3002,7 +3110,7 @@ class RequestHandler {
                 });
                 // Avoid switching account if the error is just a connection reset
                 if (!skipFinalFailureSwitch && !this._isConnectionResetError(headerMessage)) {
-                    await this.authSwitcher.handleRequestFailureAndSwitch(headerMessage, null);
+                    await this._handleRequestFailure(headerMessage, null);
                 } else if (skipFinalFailureSwitch) {
                     this.logger.info(
                         "[Request] Immediate-switch retries exhausted, skipping additional account switch."
@@ -3109,7 +3217,7 @@ class RequestHandler {
                     this._logFinalRequestFailure(result.error, "Gemini non-stream", proxyRequest.request_id);
                     // Avoid switching account if the error is just a connection reset
                     if (!result.error.skipAccountSwitch && !this._isConnectionResetError(result.error)) {
-                        await this.authSwitcher.handleRequestFailureAndSwitch(result.error, null);
+                        await this._handleRequestFailure(result.error, null);
                     } else if (result.error.skipAccountSwitch) {
                         this.logger.info(
                             "[Request] Immediate-switch retries exhausted, skipping additional account switch."

@@ -20,6 +20,9 @@ class ConfigLoader {
 
     loadConfiguration() {
         const config = {
+            accountAcquireTimeoutMs: 30000,
+            accountLoadBalancing: false,
+            accountMaxConcurrentRequests: 1,
             apiKeys: [],
             apiKeySource: "Not set",
             browserExecutablePath: null,
@@ -51,6 +54,20 @@ class ConfigLoader {
             config.httpPort = Number.isFinite(parsed) ? parsed : config.httpPort;
         }
         if (process.env.HOST) config.host = process.env.HOST;
+        if (process.env.ACCOUNT_LOAD_BALANCING)
+            config.accountLoadBalancing = process.env.ACCOUNT_LOAD_BALANCING.toLowerCase() === "true";
+        if (process.env.ACCOUNT_MAX_CONCURRENT_REQUESTS) {
+            const parsed = parseInt(process.env.ACCOUNT_MAX_CONCURRENT_REQUESTS, 10);
+            config.accountMaxConcurrentRequests = Number.isFinite(parsed)
+                ? Math.max(1, parsed)
+                : config.accountMaxConcurrentRequests;
+        }
+        if (process.env.ACCOUNT_ACQUIRE_TIMEOUT_MS) {
+            const parsed = parseInt(process.env.ACCOUNT_ACQUIRE_TIMEOUT_MS, 10);
+            config.accountAcquireTimeoutMs = Number.isFinite(parsed)
+                ? Math.max(100, parsed)
+                : config.accountAcquireTimeoutMs;
+        }
         if (process.env.STREAMING_MODE) config.streamingMode = process.env.STREAMING_MODE;
         if (process.env.FAILURE_THRESHOLD) {
             const parsed = parseInt(process.env.FAILURE_THRESHOLD, 10);
@@ -209,6 +226,9 @@ class ConfigLoader {
         this.logger.info(`  Auto Update Auth: ${config.enableAuthUpdate}`);
         this.logger.info(`  Usage Stats: ${config.enableUsageStats}`);
         this.logger.info(`  Max Contexts: ${config.maxContexts === 0 ? "Unlimited" : config.maxContexts}`);
+        this.logger.info(`  Account Load Balancing: ${config.accountLoadBalancing}`);
+        this.logger.info(`  Max Concurrent Requests per Account: ${config.accountMaxConcurrentRequests}`);
+        this.logger.info(`  Account Acquire Timeout: ${config.accountAcquireTimeoutMs}ms`);
         this.logger.info(
             `  Usage-based Switch Threshold: ${
                 config.switchOnUses > 0 ? `Switch after every ${config.switchOnUses} requests` : "Disabled"

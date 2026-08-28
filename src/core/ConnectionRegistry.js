@@ -295,16 +295,24 @@ class ConnectionRegistry extends EventEmitter {
         }
     }
 
-    isReconnectingInProgress() {
-        // Only check if current account is reconnecting, to avoid non-current account reconnection affecting current account's request handling
-        const currentAuthIndex = this.getCurrentAuthIndex ? this.getCurrentAuthIndex() : -1;
-        return currentAuthIndex >= 0 && (this.reconnectingAccounts.get(currentAuthIndex) || false);
+    isReconnectingInProgress(authIndex = null) {
+        const targetAuthIndex =
+            Number.isInteger(authIndex) && authIndex >= 0
+                ? authIndex
+                : this.getCurrentAuthIndex
+                  ? this.getCurrentAuthIndex()
+                  : -1;
+        return targetAuthIndex >= 0 && (this.reconnectingAccounts.get(targetAuthIndex) || false);
     }
 
-    isInGracePeriod() {
-        // Only check if current account is in grace period, to avoid non-current account disconnection affecting current account's request handling
-        const currentAuthIndex = this.getCurrentAuthIndex ? this.getCurrentAuthIndex() : -1;
-        return currentAuthIndex >= 0 && this.reconnectGraceTimers.has(currentAuthIndex);
+    isInGracePeriod(authIndex = null) {
+        const targetAuthIndex =
+            Number.isInteger(authIndex) && authIndex >= 0
+                ? authIndex
+                : this.getCurrentAuthIndex
+                  ? this.getCurrentAuthIndex()
+                  : -1;
+        return targetAuthIndex >= 0 && this.reconnectGraceTimers.has(targetAuthIndex);
     }
 
     getConnectionByAuth(authIndex, log = true) {

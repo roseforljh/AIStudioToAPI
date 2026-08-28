@@ -18,6 +18,7 @@
         "setup-auth": "node scripts/auth/setupAuth.js",
         "setup-auth-batch": "node scripts/auth/setupAuthBatch.js",
         "prepare": "husky install",
+        "test": "node --test tests/*.test.js",
         "lint": "eslint . && stylelint \"ui/**/*.{css,less}\"",
         "lint:fix": "eslint . --fix && stylelint \"ui/**/*.{css,less}\" --fix",
         "lint:js": "eslint .",
