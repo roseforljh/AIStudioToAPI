@@ -859,38 +859,49 @@ class StatusRoutes {
             }
         });
 
-        app.put("/api/settings/debug-mode", isAuthenticated, (req, res) => {
+        app.put("/api/settings/debug-mode", isAuthenticated, async (req, res) => {
             const currentLevel = LoggingService.getLevel();
             const newLevel = currentLevel === "DEBUG" ? "INFO" : "DEBUG";
-            LoggingService.setLevel(newLevel);
-            this.logger.info(`[WebUI] Log level switched to: ${newLevel}`);
+            try {
+                await this.serverSystem.runtimeSettingsStore.set("logLevel", newLevel);
+                LoggingService.setLevel(newLevel);
+                this.logger.info(`[WebUI] Log level switched to: ${newLevel}`);
 
-            // Sync browser log level via WebSocket (broadcasts to all active contexts)
-            const updatedCount = this.serverSystem.requestHandler.setBrowserLogLevel(newLevel);
-            const browserSynced = updatedCount > 0;
-            if (!browserSynced) {
-                this.logger.warn(`[WebUI] Browser log level sync failed (no active connections)`);
+                // Sync browser log level via WebSocket (broadcasts to all active contexts)
+                const updatedCount = this.serverSystem.requestHandler.setBrowserLogLevel(newLevel);
+                const browserSynced = updatedCount > 0;
+                if (!browserSynced) {
+                    this.logger.warn(`[WebUI] Browser log level sync failed (no active connections)`);
+                }
+
+                res.status(200).json({
+                    browserSynced,
+                    message: "settingUpdateSuccess",
+                    setting: "logLevel",
+                    updatedContexts: updatedCount,
+                    value: newLevel === "DEBUG" ? "debug" : "normal",
+                });
+            } catch (error) {
+                this.logger.error(`[WebUI] Failed to persist log level: ${error.message}`);
+                return res.status(500).json({ error: error.message, message: "settingFailed" });
             }
-
-            res.status(200).json({
-                browserSynced,
-                message: "settingUpdateSuccess",
-                setting: "logLevel",
-                updatedContexts: updatedCount,
-                value: newLevel === "DEBUG" ? "debug" : "normal",
-            });
         });
 
-        app.put("/api/settings/log-max-count", isAuthenticated, (req, res) => {
+        app.put("/api/settings/log-max-count", isAuthenticated, async (req, res) => {
             const { count } = req.body;
             const newCount = parseInt(count, 10);
 
-            if (Number.isFinite(newCount) && newCount > 0) {
+            if (!Number.isFinite(newCount) || newCount <= 0) {
+                return res.status(400).json({ error: "Invalid count", message: "settingFailed" });
+            }
+            try {
+                await this.serverSystem.runtimeSettingsStore.set("logMaxCount", newCount);
                 this.logger.setDisplayLimit(newCount);
                 this.logger.info(`[WebUI] Log display limit updated to: ${newCount}`);
                 res.status(200).json({ message: "settingUpdateSuccess", setting: "logMaxCount", value: newCount });
-            } else {
-                res.status(400).json({ error: "Invalid count", message: "settingFailed" });
+            } catch (error) {
+                this.logger.error(`[WebUI] Failed to persist log display limit: ${error.message}`);
+                return res.status(500).json({ error: error.message, message: "settingFailed" });
             }
         });
 

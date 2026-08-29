@@ -927,8 +927,7 @@ class BrowserManager {
      * Periodically cleans up popups and keeps the session alive.
      * In multi-context mode, stores the interval in the context data.
      */
-    _startHealthMonitor() {
-        const authIndex = this._currentAuthIndex;
+    _startHealthMonitor(authIndex = this._currentAuthIndex) {
         if (authIndex < 0) {
             this.logger.warn("[Browser] Cannot start health monitor: no active auth index");
             return;
@@ -953,13 +952,9 @@ class BrowserManager {
         // Run every 4 seconds
         contextData.healthMonitorInterval = setInterval(async () => {
             try {
-                // Check if this is still the current active account
-                // This prevents background contexts from running healthMonitor unnecessarily
-                if (this._currentAuthIndex !== authIndex) {
-                    // Silently skip - this context is not active
-                    return;
-                }
-
+                // In load-balancing mode, ALL initialized contexts get keep-alive.
+                // Previously this early-returned for non-current accounts, which let
+                // background contexts fall idle and stall requests routed to them.
                 const page = contextData.page;
                 // Double check page status
                 if (!page || page.isClosed()) {
@@ -2196,6 +2191,11 @@ class BrowserManager {
             } else {
                 this._throwIfContextInitAborted(authIndex, isBackgroundTask);
             }
+
+            // Start keep-alive for THIS context immediately, regardless of whether it
+            // is the current active account. Without this, non-current contexts fall
+            // idle and stall requests routed to them by the load balancer.
+            this._startHealthMonitor(authIndex);
 
             // Update auth file
             await this._updateAuthFile(authIndex);

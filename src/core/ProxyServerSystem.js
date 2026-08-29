@@ -217,6 +217,23 @@ class ProxyServerSystem extends EventEmitter {
             this.config[key] = value;
             this.logger.info(`[System] Persisted setting restored: ${key} = ${value}`);
         }
+        // Restore log-level and log-display-limit (they are not config fields,
+        // they live on the LoggingService singleton / logger instance).
+        if (Object.prototype.hasOwnProperty.call(persistedSettings, "logLevel")) {
+            const level = String(persistedSettings.logLevel).toUpperCase();
+            if (["DEBUG", "INFO", "WARN", "ERROR"].includes(level)) {
+                LoggingService.setLevel(level);
+                this.requestHandler?.setBrowserLogLevel?.(level);
+                this.logger.info(`[System] Persisted setting restored: logLevel = ${level}`);
+            }
+        }
+        if (Object.prototype.hasOwnProperty.call(persistedSettings, "logMaxCount")) {
+            const count = parseInt(persistedSettings.logMaxCount, 10);
+            if (Number.isFinite(count) && count > 0) {
+                this.logger.setDisplayLimit(count);
+                this.logger.info(`[System] Persisted setting restored: logMaxCount = ${count}`);
+            }
+        }
     }
 
     _createAuthMiddleware() {
