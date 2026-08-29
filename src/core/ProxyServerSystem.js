@@ -117,10 +117,8 @@ class ProxyServerSystem extends EventEmitter {
     }
 
     async start(initialAuthIndex = null) {
-        this.config.accountLoadBalancing = await this.runtimeSettingsStore.get(
-            "accountLoadBalancing",
-            this.config.accountLoadBalancing
-        );
+        const persistedSettings = await this.runtimeSettingsStore.getAll();
+        this._applyPersistedSettings(persistedSettings);
         this.logger.info(`[System] Runtime account load balancing: ${this.config.accountLoadBalancing}`);
         this.logger.info("[System] Starting flexible startup process...");
         await this._startHttpServer();
@@ -197,6 +195,28 @@ class ProxyServerSystem extends EventEmitter {
         }
 
         this.emit("started");
+    }
+
+    _applyPersistedSettings(persistedSettings = {}) {
+        if (!persistedSettings || typeof persistedSettings !== "object") return;
+        const persistableKeys = [
+            "accountLoadBalancing",
+            "streamingMode",
+            "forceThinking",
+            "forceWebSearch",
+            "forceCodeExecution",
+            "forceUrlContext",
+            "checkUpdate",
+            "enableAuthUpdate",
+            "safetySettingsThreshold",
+        ];
+        for (const key of persistableKeys) {
+            if (!Object.prototype.hasOwnProperty.call(persistedSettings, key)) continue;
+            const value = persistedSettings[key];
+            if (value === null || value === undefined) continue;
+            this.config[key] = value;
+            this.logger.info(`[System] Persisted setting restored: ${key} = ${value}`);
+        }
     }
 
     _createAuthMiddleware() {

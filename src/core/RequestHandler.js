@@ -264,7 +264,14 @@ class RequestHandler {
         res.once("close", abort);
         let lease;
         try {
-            lease = await this.accountLoadBalancer.acquire({ signal: controller.signal });
+            const acquireTimeoutMs = Math.max(
+                this.accountLoadBalancer.acquireTimeoutMs,
+                LOAD_BALANCER_TOTAL_REQUEST_TIMEOUT_MS
+            );
+            lease = await this.accountLoadBalancer.acquire({
+                signal: controller.signal,
+                timeoutMs: acquireTimeoutMs,
+            });
             const assignedAuthIndex = lease.authIndex;
             if (
                 !this.browserManager.contexts.has(assignedAuthIndex) ||
@@ -282,7 +289,17 @@ class RequestHandler {
         } catch (error) {
             if (!res.headersSent && !res.writableEnded) {
                 if (error.name === "AbortError") return;
-                this._sendErrorResponse(res, 503, "No account slot became available before timeout.");
+                const snapshot = this.accountLoadBalancer.getSnapshot();
+                const detail = [
+                    `active=${snapshot.activeRequests}`,
+                    `limit=${snapshot.globalConcurrencyLimit}`,
+                    `eligibleAccounts=${snapshot.accounts.length}`,
+                ].join(" ");
+                this.logger.warn(
+                    `[LoadBalancer] Failed to acquire account slot (${error.code || error.name || "error"}): ${detail}`
+                );
+                res.setHeader("Retry-After", "5");
+                this._sendErrorResponse(res, 503, `No account slot became available before timeout. ${detail}`);
             }
             return undefined;
         } finally {
@@ -3486,6 +3503,42 @@ class RequestHandler {
                 this._cancelCurrentAttemptBeforeRetry(proxyRequest, currentQueueAuthIndex);
 
                 const errorStatus = Number(errorPayload?.status);
+                const isStallTimeoutStatus = errorStatus === 504;
+                if (
+                    this.config.accountLoadBalancing &&
+                    this.accountRequestContext.getLease() &&
+                    isStallTimeoutStatus &&
+                    retryAttempt < this.config.maxRetries
+                ) {
+                    try {
+                        const moved = await this._moveCurrentAccountLease(
+                            errorPayload,
+                            immediateSwitchTracker.attemptedAuthIndices
+                        );
+                        if (moved) {
+                            const newAuthIndex = this.accountRequestContext.getLease()?.authIndex;
+                            if (Number.isInteger(newAuthIndex) && newAuthIndex >= 0) {
+                                this._advanceProxyRequestAttempt(proxyRequest);
+                                currentQueue = this.connectionRegistry.createMessageQueue(
+                                    proxyRequest.request_id,
+                                    newAuthIndex,
+                                    proxyRequest.request_attempt_id
+                                );
+                                currentQueueAuthIndex = newAuthIndex;
+                                immediateSwitchTracker.attemptedAuthIndices.add(newAuthIndex);
+                                await new Promise(resolve => setTimeout(resolve, this.config.retryDelay));
+                                retryAttempt++;
+                                continue;
+                            }
+                        }
+                    } catch (moveError) {
+                        this.logger.warn(
+                            `[LoadBalancer] Unable to switch to another account after stall on #${currentQueueAuthIndex}: ${moveError.message}`
+                        );
+                        lastError = { ...errorPayload, skipAccountSwitch: true };
+                        break;
+                    }
+                }
                 const isNonRetryableEmbeddingClientError =
                     (errorStatus === 400 || errorStatus === 404) &&
                     this._categorizeRequest(proxyRequest?.path, "request") === "embedding";

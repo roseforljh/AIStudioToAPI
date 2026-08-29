@@ -719,66 +719,121 @@ class StatusRoutes {
             }
         });
 
-        app.put("/api/settings/streaming-mode", isAuthenticated, (req, res) => {
+        app.put("/api/settings/streaming-mode", isAuthenticated, async (req, res) => {
             const newMode = req.body.mode;
-            if (newMode === "fake" || newMode === "real") {
-                this.config.streamingMode = newMode;
+            if (newMode !== "fake" && newMode !== "real") {
+                return res.status(400).json({ message: "errorInvalidMode" });
+            }
+            const previous = this.config.streamingMode;
+            this.config.streamingMode = newMode;
+            try {
+                await this.serverSystem.runtimeSettingsStore.set("streamingMode", newMode);
                 this.logger.info(
                     `[WebUI] Streaming mode switched by authenticated user to: ${this.config.streamingMode}`
                 );
-                res.status(200).json({ message: "settingUpdateSuccess", setting: "streamingMode", value: newMode });
-            } else {
-                res.status(400).json({ message: "errorInvalidMode" });
+                return res
+                    .status(200)
+                    .json({ message: "settingUpdateSuccess", setting: "streamingMode", value: newMode });
+            } catch (error) {
+                this.config.streamingMode = previous;
+                this.logger.error(`[WebUI] Failed to persist streaming mode: ${error.message}`);
+                return res.status(500).json({ error: error.message, message: "settingFailed" });
             }
         });
 
-        app.put("/api/settings/force-thinking", isAuthenticated, (req, res) => {
-            this.config.forceThinking = !this.config.forceThinking;
-            const statusText = this.config.forceThinking;
-            this.logger.info(`[WebUI] Force thinking toggle switched to: ${statusText}`);
-            res.status(200).json({ message: "settingUpdateSuccess", setting: "forceThinking", value: statusText });
+        app.put("/api/settings/force-thinking", isAuthenticated, async (req, res) => {
+            const newValue = !this.config.forceThinking;
+            try {
+                await this.serverSystem.runtimeSettingsStore.set("forceThinking", newValue);
+                this.config.forceThinking = newValue;
+                this.logger.info(`[WebUI] Force thinking toggle switched to: ${newValue}`);
+                return res
+                    .status(200)
+                    .json({ message: "settingUpdateSuccess", setting: "forceThinking", value: newValue });
+            } catch (error) {
+                this.logger.error(`[WebUI] Failed to persist force-thinking: ${error.message}`);
+                return res.status(500).json({ error: error.message, message: "settingFailed" });
+            }
         });
 
-        app.put("/api/settings/force-web-search", isAuthenticated, (req, res) => {
-            this.config.forceWebSearch = !this.config.forceWebSearch;
-            const statusText = this.config.forceWebSearch;
-            this.logger.info(`[WebUI] Force web search toggle switched to: ${statusText}`);
-            res.status(200).json({ message: "settingUpdateSuccess", setting: "forceWebSearch", value: statusText });
+        app.put("/api/settings/force-web-search", isAuthenticated, async (req, res) => {
+            const newValue = !this.config.forceWebSearch;
+            try {
+                await this.serverSystem.runtimeSettingsStore.set("forceWebSearch", newValue);
+                this.config.forceWebSearch = newValue;
+                this.logger.info(`[WebUI] Force web search toggle switched to: ${newValue}`);
+                return res
+                    .status(200)
+                    .json({ message: "settingUpdateSuccess", setting: "forceWebSearch", value: newValue });
+            } catch (error) {
+                this.logger.error(`[WebUI] Failed to persist force-web-search: ${error.message}`);
+                return res.status(500).json({ error: error.message, message: "settingFailed" });
+            }
         });
 
-        app.put("/api/settings/force-code-execution", isAuthenticated, (req, res) => {
-            this.config.forceCodeExecution = !this.config.forceCodeExecution;
-            const statusText = this.config.forceCodeExecution;
-            this.logger.info(`[WebUI] Force code execution toggle switched to: ${statusText}`);
-            res.status(200).json({
-                message: "settingUpdateSuccess",
-                setting: "forceCodeExecution",
-                value: statusText,
-            });
+        app.put("/api/settings/force-code-execution", isAuthenticated, async (req, res) => {
+            const newValue = !this.config.forceCodeExecution;
+            try {
+                await this.serverSystem.runtimeSettingsStore.set("forceCodeExecution", newValue);
+                this.config.forceCodeExecution = newValue;
+                this.logger.info(`[WebUI] Force code execution toggle switched to: ${newValue}`);
+                return res.status(200).json({
+                    message: "settingUpdateSuccess",
+                    setting: "forceCodeExecution",
+                    value: newValue,
+                });
+            } catch (error) {
+                this.logger.error(`[WebUI] Failed to persist force-code-execution: ${error.message}`);
+                return res.status(500).json({ error: error.message, message: "settingFailed" });
+            }
         });
 
-        app.put("/api/settings/force-url-context", isAuthenticated, (req, res) => {
-            this.config.forceUrlContext = !this.config.forceUrlContext;
-            const statusText = this.config.forceUrlContext;
-            this.logger.info(`[WebUI] Force URL context toggle switched to: ${statusText}`);
-            res.status(200).json({ message: "settingUpdateSuccess", setting: "forceUrlContext", value: statusText });
+        app.put("/api/settings/force-url-context", isAuthenticated, async (req, res) => {
+            const newValue = !this.config.forceUrlContext;
+            try {
+                await this.serverSystem.runtimeSettingsStore.set("forceUrlContext", newValue);
+                this.config.forceUrlContext = newValue;
+                this.logger.info(`[WebUI] Force URL context toggle switched to: ${newValue}`);
+                return res
+                    .status(200)
+                    .json({ message: "settingUpdateSuccess", setting: "forceUrlContext", value: newValue });
+            } catch (error) {
+                this.logger.error(`[WebUI] Failed to persist force-url-context: ${error.message}`);
+                return res.status(500).json({ error: error.message, message: "settingFailed" });
+            }
         });
 
-        app.put("/api/settings/check-update", isAuthenticated, (req, res) => {
-            this.config.checkUpdate = !this.config.checkUpdate;
-            const statusText = this.config.checkUpdate;
-            this.logger.info(`[WebUI] Check update toggle switched to: ${statusText}`);
-            res.status(200).json({ message: "settingUpdateSuccess", setting: "checkUpdate", value: statusText });
+        app.put("/api/settings/check-update", isAuthenticated, async (req, res) => {
+            const newValue = !this.config.checkUpdate;
+            try {
+                await this.serverSystem.runtimeSettingsStore.set("checkUpdate", newValue);
+                this.config.checkUpdate = newValue;
+                this.logger.info(`[WebUI] Check update toggle switched to: ${newValue}`);
+                return res
+                    .status(200)
+                    .json({ message: "settingUpdateSuccess", setting: "checkUpdate", value: newValue });
+            } catch (error) {
+                this.logger.error(`[WebUI] Failed to persist check-update: ${error.message}`);
+                return res.status(500).json({ error: error.message, message: "settingFailed" });
+            }
         });
 
-        app.put("/api/settings/enable-auth-update", isAuthenticated, (req, res) => {
-            this.config.enableAuthUpdate = !this.config.enableAuthUpdate;
-            const statusText = this.config.enableAuthUpdate;
-            this.logger.info(`[WebUI] Enable auth update toggle switched to: ${statusText}`);
-            res.status(200).json({ message: "settingUpdateSuccess", setting: "enableAuthUpdate", value: statusText });
+        app.put("/api/settings/enable-auth-update", isAuthenticated, async (req, res) => {
+            const newValue = !this.config.enableAuthUpdate;
+            try {
+                await this.serverSystem.runtimeSettingsStore.set("enableAuthUpdate", newValue);
+                this.config.enableAuthUpdate = newValue;
+                this.logger.info(`[WebUI] Enable auth update toggle switched to: ${newValue}`);
+                return res
+                    .status(200)
+                    .json({ message: "settingUpdateSuccess", setting: "enableAuthUpdate", value: newValue });
+            } catch (error) {
+                this.logger.error(`[WebUI] Failed to persist enable-auth-update: ${error.message}`);
+                return res.status(500).json({ error: error.message, message: "settingFailed" });
+            }
         });
 
-        app.put("/api/settings/safety-settings-threshold", isAuthenticated, (req, res) => {
+        app.put("/api/settings/safety-settings-threshold", isAuthenticated, async (req, res) => {
             const newThreshold = String(req.body?.value || "")
                 .trim()
                 .toUpperCase();
@@ -787,13 +842,21 @@ class StatusRoutes {
                 return res.status(400).json({ error: "Invalid safety settings threshold", message: "settingFailed" });
             }
 
+            const previous = this.config.safetySettingsThreshold;
             this.config.safetySettingsThreshold = newThreshold;
-            this.logger.info(`[WebUI] Safety settings threshold updated to: ${newThreshold}`);
-            return res.status(200).json({
-                message: "settingUpdateSuccess",
-                setting: "safetySettingsThreshold",
-                value: newThreshold,
-            });
+            try {
+                await this.serverSystem.runtimeSettingsStore.set("safetySettingsThreshold", newThreshold);
+                this.logger.info(`[WebUI] Safety settings threshold updated to: ${newThreshold}`);
+                return res.status(200).json({
+                    message: "settingUpdateSuccess",
+                    setting: "safetySettingsThreshold",
+                    value: newThreshold,
+                });
+            } catch (error) {
+                this.config.safetySettingsThreshold = previous;
+                this.logger.error(`[WebUI] Failed to persist safety threshold: ${error.message}`);
+                return res.status(500).json({ error: error.message, message: "settingFailed" });
+            }
         });
 
         app.put("/api/settings/debug-mode", isAuthenticated, (req, res) => {

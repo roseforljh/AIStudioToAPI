@@ -21,6 +21,14 @@ class RuntimeSettingsStore {
         return this.settings;
     }
 
+    async load() {
+        return this._load();
+    }
+
+    async getAll() {
+        return { ...(await this._load()) };
+    }
+
     async get(key, fallback = undefined) {
         const settings = await this._load();
         return Object.prototype.hasOwnProperty.call(settings, key) ? settings[key] : fallback;
@@ -28,7 +36,11 @@ class RuntimeSettingsStore {
 
     async set(key, value) {
         const settings = await this._load();
-        settings[key] = value;
+        if (value === undefined || value === null) {
+            delete settings[key];
+        } else {
+            settings[key] = value;
+        }
         this.writePromise = this.writePromise.then(async () => {
             await fs.mkdir(path.dirname(this.filePath), { recursive: true });
             const temporaryPath = `${this.filePath}.tmp`;

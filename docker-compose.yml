@@ -1,0 +1,18 @@
+name: aistudio-to-api
+
+services:
+  app:
+    build:
+      context: .
+      args:
+        VERSION: 1.3.6
+    image: aistudio-to-api:local
+    container_name: aistudio-to-api
+    ports:
+      - "127.0.0.1:18760:7860"
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./auth:/app/configs/auth
+      - ./data:/app/data
