@@ -142,6 +142,30 @@ test("cools down an account by status and restores it after expiry", async () =>
     leases.forEach(lease => lease.release());
 });
 
+test("moves through every eligible account for repeated 403 responses before exhausting alternatives", async () => {
+    const { balancer } = createBalancer({
+        acquireTimeoutMs: 20,
+        connected: [0, 1, 2],
+        cooldownByStatus: { 403: 300 },
+        maxConcurrentRequests: 3,
+    });
+    const lease = await balancer.acquire();
+    const attempted = new Set([lease.authIndex]);
+
+    await lease.move({ exclude: attempted, release: { status: 403 } });
+    attempted.add(lease.authIndex);
+    await lease.move({ exclude: attempted, release: { status: 403 } });
+    attempted.add(lease.authIndex);
+
+    assert.equal(attempted.size, 3);
+    await assert.rejects(
+        lease.move({ exclude: attempted, release: { status: 403 } }),
+        error => error.code === "ACCOUNT_ACQUIRE_TIMEOUT"
+    );
+    assert.equal(attempted.has(lease.authIndex), true);
+    lease.release();
+});
+
 test("release is idempotent", async () => {
     const { balancer } = createBalancer({ connected: [0] });
     const lease = await balancer.acquire();
@@ -192,6 +216,19 @@ test("computes a one-minute request and account breakdown", async () => {
     assert.equal(recent.activeRequests, 1);
     assert.equal(recent.requestsLastMinute, 2);
     assert.deepEqual(recent.accounts, [{ accountName: "alpha", authIndex: 0, count: 2, key: "0:alpha" }]);
+});
+
+test("uses all eligible accounts as the attempt limit while load balancing is enabled", () => {
+    const RequestHandler = require("../src/core/RequestHandler");
+    const handler = Object.create(RequestHandler.prototype);
+    handler.config = { accountLoadBalancing: true, maxRetries: 3 };
+    handler.accountLoadBalancer = {
+        getSnapshot: () => ({ accounts: Array.from({ length: 10 }), globalConcurrencyLimit: 5 }),
+    };
+    assert.equal(handler._getRequestAttemptLimit(), 10);
+
+    handler.config.accountLoadBalancing = false;
+    assert.equal(handler._getRequestAttemptLimit(), 3);
 });
 
 test("keeps the leased account isolated across concurrent async request contexts", async () => {

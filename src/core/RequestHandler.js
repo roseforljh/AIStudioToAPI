@@ -42,7 +42,7 @@ class RequestHandler {
         this.accountRequestContext = new AccountRequestContext();
         this.accountLoadBalancer = new AccountLoadBalancer({
             acquireTimeoutMs: config.accountAcquireTimeoutMs,
-            cooldownByStatus: { 429: 60000, 503: 30000 },
+            cooldownByStatus: { 403: 300000, 429: 60000, 503: 30000 },
             getEligibleAuthIndices: () => {
                 if (!config.accountLoadBalancing) return [this.authSwitcher.currentAuthIndex];
                 return [...this.connectionRegistry.getAllConnections().entries()]
@@ -737,6 +737,13 @@ class RequestHandler {
         }
 
         return true;
+    }
+
+    _getRequestAttemptLimit() {
+        const configured = Math.max(1, Number(this.config?.maxRetries) || 1);
+        if (!this.config?.accountLoadBalancing) return configured;
+        const eligibleAccounts = this.accountLoadBalancer?.getSnapshot?.()?.accounts?.length || 0;
+        return Math.max(configured, eligibleAccounts);
     }
 
     _createImmediateSwitchTracker(initialAuthIndex = this.currentAuthIndex) {
@@ -3376,7 +3383,9 @@ class RequestHandler {
         let retryAttempt = 1;
         const immediateSwitchTracker = this._createImmediateSwitchTracker(currentQueueAuthIndex);
 
-        while (retryAttempt <= this.config.maxRetries) {
+        const requestAttemptLimit = this._getRequestAttemptLimit();
+
+        while (retryAttempt <= requestAttemptLimit) {
             if (totalDeadline !== null && Date.now() >= totalDeadline) {
                 lastError = { message: "Load-balancer request deadline exceeded.", status: 504 };
                 break;
