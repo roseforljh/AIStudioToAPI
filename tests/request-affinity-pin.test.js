@@ -15,6 +15,7 @@ function createContext({ cached = [], pin = PIN, fileSize = 1024, inlineCap = IN
         logger: { warn() {}, info() {}, error() {}, debug() {} },
         fileReferenceInliner: { maxInlineBytes: inlineCap },
         _inlineSizeCapBytes: RequestHandler.prototype._inlineSizeCapBytes,
+        _loadBalancerTimeouts: RequestHandler.prototype._loadBalancerTimeouts,
         uploadSessionAffinity: {
             resolvePinnedAuthIndex(args) {
                 calls.push(args);
@@ -126,6 +127,16 @@ test("_inlineSizeCapBytes 优先级：运行时设置 > env > 内联器默认", 
     assert.equal(RequestHandler.prototype._inlineSizeCapBytes.call(context), INLINE_CAP);
     context.config.fileInlineMaxBytes = 64 * 1024 * 1024;
     assert.equal(RequestHandler.prototype._inlineSizeCapBytes.call(context), 64 * 1024 * 1024);
+});
+
+test("超时窗口默认 45s/120s，可被运行时设置覆盖（超大媒体放宽用）", () => {
+    const { context } = createContext({});
+    assert.deepEqual(context._loadBalancerTimeouts(), { initial: 45000, total: 120000 });
+    context.config.initialResponseTimeoutMs = 240000;
+    context.config.totalRequestTimeoutMs = 900000;
+    assert.deepEqual(context._loadBalancerTimeouts(), { initial: 240000, total: 900000 });
+    context.config.initialResponseTimeoutMs = 0;
+    assert.equal(context._loadBalancerTimeouts().initial, 45000, "非法值回退默认 45s");
 });
 
 test("上传会话参数存在时按会话粘性处理", () => {

@@ -311,10 +311,37 @@ class RequestHandler {
      */
     _inlineSizeCapBytes() {
         const fromConfig = Number(this.config && this.config.fileInlineMaxBytes);
-        if (Number.isFinite(fromConfig) && fromConfig > 0) return fromConfig;
+        if (Number.isFinite(fromConfig) && fromConfig > 0) {
+            return fromConfig;
+        }
         const fromEnv = Number(process.env.FILES_INLINE_MAX_BYTES);
-        if (Number.isFinite(fromEnv) && fromEnv > 0) return fromEnv;
+        if (Number.isFinite(fromEnv) && fromEnv > 0) {
+            return fromEnv;
+        }
         return Number(this.fileReferenceInliner && this.fileReferenceInliner.maxInlineBytes) || Infinity;
+    }
+
+    /**
+     * 负载均衡路径的两个等待窗口（毫秒）：
+     *  - initial: 等待「首次响应」的窗口（默认 45s，硬编码），决定单次尝试能否等到上游返回
+     *  - total:   单请求总预算（默认 120s），超了就不再重试
+     * 超大媒体（内联几十~上百 MB）上游处理更久，可用 data/runtime-settings.json 的
+     * initialResponseTimeoutMs / totalRequestTimeoutMs 放宽。
+     */
+    _loadBalancerTimeouts() {
+        const config = this.config || {};
+        const initial = Number(config.initialResponseTimeoutMs);
+        const total = Number(config.totalRequestTimeoutMs);
+        return {
+            initial:
+                Number.isFinite(initial) && initial > 0
+                    ? initial
+                    : LOAD_BALANCER_INITIAL_RESPONSE_TIMEOUT_MS,
+            total:
+                Number.isFinite(total) && total > 0
+                    ? total
+                    : LOAD_BALANCER_TOTAL_REQUEST_TIMEOUT_MS,
+        };
     }
 
     _extractAffinityPin({ queryParams = null, rawUrl = "", requestPath = "", bodyBuffer = null } = {}) {
@@ -534,7 +561,16 @@ class RequestHandler {
             return { ok: true };
         }
         const references = inliner.findReferences(body);
-        if (!references.length) return { ok: true };
+        if (!references.length) {
+            // PATCH(file-inline-diag): 这条路径原来静默返回，导致「文件引用没被内联」时
+            // 日志里什么都看不到，只能看到上游 403/400「Cannot fetch content」。
+            this.logger.warn(
+                `[FileInline] 生成请求体里没有可解析的文件引用（path=${String(
+                    proxyRequest.path || ""
+                )}, field=${bodyField}, bodyLen=${rawBody.length}, keys=${Object.keys(body || {}).join(",")}）`
+            );
+            return { ok: true };
+        }
 
         let totalBytes = 0;
         for (const reference of references) {
@@ -632,7 +668,7 @@ class RequestHandler {
         try {
             const acquireTimeoutMs = Math.max(
                 this.accountLoadBalancer.acquireTimeoutMs,
-                LOAD_BALANCER_TOTAL_REQUEST_TIMEOUT_MS
+                this._loadBalancerTimeouts().total
             );
             lease = await this.accountLoadBalancer.acquire({
                 signal: controller.signal,
@@ -3809,7 +3845,7 @@ class RequestHandler {
         let lastError = null;
         let currentQueue = messageQueue;
         const totalDeadline = this.config.accountLoadBalancing
-            ? Date.now() + LOAD_BALANCER_TOTAL_REQUEST_TIMEOUT_MS
+            ? Date.now() + this._loadBalancerTimeouts().total
             : null;
         const registeredQueueAuthIndex = this.connectionRegistry.getAuthIndexForRequest(proxyRequest.request_id);
         // Track the authIndex registered for the current queue, which may differ from the global current account.
@@ -3818,7 +3854,7 @@ class RequestHandler {
                 ? registeredQueueAuthIndex
                 : this.currentAuthIndex;
         const initialResponseTimeout = this.config.accountLoadBalancing
-            ? Math.min(this.timeouts.FAKE_STREAM, LOAD_BALANCER_INITIAL_RESPONSE_TIMEOUT_MS)
+            ? Math.min(this.timeouts.FAKE_STREAM, this._loadBalancerTimeouts().initial)
             : this.timeouts.FAKE_STREAM;
         let retryAttempt = 1;
         const immediateSwitchTracker = this._createImmediateSwitchTracker(currentQueueAuthIndex);

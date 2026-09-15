@@ -204,6 +204,8 @@ class ProxyServerSystem extends EventEmitter {
             "streamingMode",
             "fileOversizeReference",
             "fileInlineMaxBytes",
+            "initialResponseTimeoutMs",
+            "totalRequestTimeoutMs",
             "forceThinking",
             "forceWebSearch",
             "forceCodeExecution",
