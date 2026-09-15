@@ -46,7 +46,9 @@ class RequestHandler {
         this.accountRequestContext = new AccountRequestContext();
         this.accountLoadBalancer = new AccountLoadBalancer({
             acquireTimeoutMs: config.accountAcquireTimeoutMs,
-            cooldownByStatus: { 403: 300000, 429: 60000, 503: 30000 },
+            // 403 基础冷却 30s（连续 403 会自动升档到 300s 上限）：上游 403 常常只针对某一类
+            // 请求/某一时刻，若直接用 300s 会把整池按死，导致连纯文本请求都拿 503。
+            cooldownByStatus: { 403: 30000, 429: 60000, 503: 30000 },
             getEligibleAuthIndices: () => {
                 if (!config.accountLoadBalancing) return [this.authSwitcher.currentAuthIndex];
                 const ready = [...this.connectionRegistry.getAllConnections().entries()]

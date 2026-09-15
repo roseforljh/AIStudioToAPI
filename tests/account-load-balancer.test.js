@@ -110,7 +110,11 @@ test("preserves a status cooldown when moving has no alternative account", async
         error => error.code === "ACCOUNT_ACQUIRE_TIMEOUT"
     );
     lease.release();
-    await assert.rejects(balancer.acquire({ timeoutMs: 20 }), error => error.code === "ACCOUNT_ACQUIRE_TIMEOUT");
+    assert.equal(balancer.getSnapshot().accounts[0].cooldownUntil, 1060);
+    // 全部账号都在冷却时不再直接失败：回退到最快解冻的账号，避免前端 503
+    const fallback = await balancer.acquire({ timeoutMs: 20 });
+    assert.equal(fallback.authIndex, 0);
+    fallback.release();
     now += 61;
     balancer.notifyAvailabilityChanged();
     const next = await balancer.acquire();

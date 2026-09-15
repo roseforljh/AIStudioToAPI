@@ -24,6 +24,13 @@ class AccountLoadBalancer {
                 Math.max(0, Number(duration) || 0),
             ])
         );
+        // 连续失败时冷却时间按倍率升档，成功一次即清零：
+        // 既不会因为一次 403 就把整池按死 5 分钟，又能让持续异常的账号真正退避。
+        const escalation = Number(options.cooldownEscalation);
+        this.cooldownEscalation = Number.isFinite(escalation) && escalation > 1 ? escalation : 2;
+        const maxCooldown = Number(options.maxCooldownMs);
+        this.maxCooldownMs =
+            Number.isFinite(maxCooldown) && maxCooldown > 0 ? maxCooldown : 300000;
         this.now = typeof options.now === "function" ? options.now : Date.now;
         this.logger = options.logger || null;
         this.states = new Map();
@@ -97,7 +104,24 @@ class AccountLoadBalancer {
             return a.authIndex - b.authIndex;
         });
 
-        return eligible.length > 0 ? eligible[0].authIndex : null;
+        if (eligible.length > 0) return eligible[0].authIndex;
+
+        // 所有账号都在冷却（或槽位全满）时，宁可回退到“最快解冻”的账号重试一次，
+        // 也不要让前端直接拿到 503 —— 上游 403 常常只对某一类请求生效，
+        // 换个账号往往是通的。粘性请求（requirePreferred）例外：换号等于上游 500。
+        if (options.requirePreferred) return null;
+        const fallback = [...new Set(this.getEligibleAuthIndices())]
+            .filter(authIndex => Number.isInteger(authIndex) && authIndex >= 0 && !excluded.has(authIndex))
+            .map(authIndex => ({ authIndex, state: this._getState(authIndex) }))
+            .filter(({ state }) => state.activeRequests < this.maxConcurrentPerAccount)
+            .sort((a, b) => a.state.cooldownUntil - b.state.cooldownUntil);
+        if (fallback.length > 0) {
+            this.logger?.warn?.(
+                `[LoadBalancer] 所有账号都在冷却中，回退到最快解冻的 #${fallback[0].authIndex} 以避免 503`
+            );
+            return fallback[0].authIndex;
+        }
+        return null;
     }
 
     _getGlobalConcurrencyLimit() {
@@ -135,17 +159,31 @@ class AccountLoadBalancer {
         state.lastAssignedSequence = this.assignmentSequence++;
     }
 
+    _escalatedCooldownMs(baseCooldownMs, consecutiveFailures) {
+        const base = Math.max(0, Number(baseCooldownMs) || 0);
+        if (base === 0) return 0;
+        const failures = Math.max(1, Number(consecutiveFailures) || 1);
+        const raw = base * Math.pow(this.cooldownEscalation, failures - 1);
+        return Math.max(base, Math.min(this.maxCooldownMs, Math.round(raw)));
+    }
+
     _release(authIndex, options = {}) {
         const state = this._getState(authIndex);
         state.activeRequests = Math.max(0, state.activeRequests - 1);
         const status = Number(options.status);
-        const cooldownMs = this.cooldownByStatus.get(status) || 0;
-        if (cooldownMs > 0) {
+        const baseCooldownMs = this.cooldownByStatus.get(status) || 0;
+        if (baseCooldownMs > 0) {
+            state.consecutiveCooldowns = (state.consecutiveCooldowns || 0) + 1;
+            const cooldownMs = this._escalatedCooldownMs(baseCooldownMs, state.consecutiveCooldowns);
             state.cooldownUntil = Math.max(state.cooldownUntil, this.now() + cooldownMs);
             this._scheduleWakeup(cooldownMs);
             this.logger?.warn?.(
-                `[LoadBalancer] Account #${authIndex} cooling down for ${cooldownMs}ms after ${status}`
+                `[LoadBalancer] Account #${authIndex} cooling down for ${cooldownMs}ms after ${status}` +
+                    ` (连续第 ${state.consecutiveCooldowns} 次，基础 ${baseCooldownMs}ms)`
             );
+        } else if (!Number.isFinite(status) || (status >= 200 && status < 300)) {
+            // 成功（或未带状态）释放：清零升档计数。
+            state.consecutiveCooldowns = 0;
         }
         this._drainWaiters();
     }
