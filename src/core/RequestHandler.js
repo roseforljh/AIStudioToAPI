@@ -305,6 +305,18 @@ class RequestHandler {
 
     // === Upload / file affinity (PATCH(upload-affinity)) ===
 
+    /**
+     * 内联体积上限（字节）。可运行时调整（data/runtime-settings.json 的 fileInlineMaxBytes），
+     * 否则退回 env FILES_INLINE_MAX_BYTES / FileReferenceInliner 默认值。
+     */
+    _inlineSizeCapBytes() {
+        const fromConfig = Number(this.config && this.config.fileInlineMaxBytes);
+        if (Number.isFinite(fromConfig) && fromConfig > 0) return fromConfig;
+        const fromEnv = Number(process.env.FILES_INLINE_MAX_BYTES);
+        if (Number.isFinite(fromEnv) && fromEnv > 0) return fromEnv;
+        return Number(this.fileReferenceInliner && this.fileReferenceInliner.maxInlineBytes) || Infinity;
+    }
+
     _extractAffinityPin({ queryParams = null, rawUrl = "", requestPath = "", bodyBuffer = null } = {}) {
         const affinity = this.uploadSessionAffinity;
         if (!affinity || !this.config.accountLoadBalancing) return null;
@@ -319,14 +331,23 @@ class RequestHandler {
                 }
             }
             if (!uploadSessionId && fileIds.length === 0) return null;
+            // PATCH(file-owner-affinity): 文件管理路由（GET/DELETE/PATCH /v1beta/files/{id}）必须回到
+            // 文件所属账号——换账号访问同一文件时上游直接 500 INTERNAL（实测：JMJ 轮询文件状态即失败）。
+            // 这一条不受「本地已缓存」豁免影响：缓存只在生成请求里能替代 fileUri，救不了文件管理路由。
+            if (pathFileId) return affinity.resolvePinnedAuthIndex({ uploadSessionId, fileIds });
             // PATCH(file-inline): 能被本地缓存内联的文件不需要粘在所属账号上——
             // 粘性会阻止 403 换号，而部分账号对媒体请求会返回 403（实测）。
+            const inlineCapBytes = this._inlineSizeCapBytes();
             const allFilesInlinable =
                 fileIds.length > 0 &&
                 !uploadSessionId &&
                 this.uploadedFileStore &&
                 this.uploadedFileStore.enabled &&
-                fileIds.every(id => Boolean(this.uploadedFileStore.getEntry(id)));
+                fileIds.every(id => {
+                    const entry = this.uploadedFileStore.getEntry(id);
+                    // 超过内联上限的文件不能靠缓存替代 fileUri，必须回到创建者账号走引用路径。
+                    return Boolean(entry) && Number(entry.size) <= inlineCapBytes;
+                });
             if (allFilesInlinable) return null;
             return affinity.resolvePinnedAuthIndex({ uploadSessionId, fileIds });
         } catch (error) {
@@ -520,8 +541,25 @@ class RequestHandler {
             const entry = store.getEntry(reference.fileId);
             if (!entry) continue;
             totalBytes += entry.size;
-            if (totalBytes > inliner.maxInlineBytes) {
-                const limitMiB = (inliner.maxInlineBytes / 1048576).toFixed(0);
+            const inlineCapBytes = this._inlineSizeCapBytes();
+            if (totalBytes > inlineCapBytes) {
+                const limitMiB = (inlineCapBytes / 1048576).toFixed(0);
+                // PATCH(file-oversize): 文件超过内联上限时，不再一律 413 —— 若开关打开且当前账号
+                // 正是文件创建者，就保留 fileUri 引用交给该账号处理（前端 JMJ 的 75.9MB 视频即走这条）。
+                const ownerPin =
+                    this.config.fileOversizeReference === true && this.uploadSessionAffinity
+                        ? this.uploadSessionAffinity.resolvePinnedAuthIndex({
+                              uploadSessionId: null,
+                              fileIds: references.map(item => item.fileId),
+                          })
+                        : null;
+                if (ownerPin && ownerPin.authIndex === this.currentAuthIndex) {
+                    this.logger.warn(
+                        `[FileInline] 合计 ${(totalBytes / 1048576).toFixed(1)} MB 超过内联上限 ${limitMiB} MB，` +
+                            `改用 fileUri 引用由创建者账号 #${this.currentAuthIndex} 处理（跳过内联）。`
+                    );
+                    return { ok: true, oversized: true, skipped: true };
+                }
                 return {
                     ok: false,
                     error: {

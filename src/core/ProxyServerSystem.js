@@ -202,6 +202,8 @@ class ProxyServerSystem extends EventEmitter {
         const persistableKeys = [
             "accountLoadBalancing",
             "streamingMode",
+            "fileOversizeReference",
+            "fileInlineMaxBytes",
             "forceThinking",
             "forceWebSearch",
             "forceCodeExecution",
