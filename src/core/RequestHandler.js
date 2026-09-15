@@ -14,6 +14,8 @@ const FormatConverter = require("./FormatConverter");
 const AccountLoadBalancer = require("./AccountLoadBalancer");
 const AccountRequestContext = require("./AccountRequestContext");
 const UploadSessionAffinity = require("./UploadSessionAffinity");
+const UploadedFileStore = require("./UploadedFileStore");
+const FileReferenceInliner = require("./FileReferenceInliner");
 const path = require("path");
 const { isUserAbortedError } = require("../utils/CustomErrors");
 const { QueueClosedError, QueueTimeoutError } = require("../utils/MessageQueue");
@@ -90,7 +92,17 @@ class RequestHandler {
         // 这里记录「上传会话 / 文件 -> 账号」的粘性映射，让后续请求回到同一账号。
         this.uploadSessionAffinity = new UploadSessionAffinity({
             filePath: path.join(process.cwd(), "data", "upload-affinity.json"),
-            logger,
+            logger: this.logger,
+        });
+        this.uploadedFileStore = new UploadedFileStore({
+            dir: path.join(process.cwd(), "data", "files-cache"),
+            maxTotalBytes: Number(process.env.FILES_CACHE_MAX_BYTES) || undefined,
+            ttlMs: Number(process.env.FILES_CACHE_TTL_MS) || undefined,
+            logger: this.logger,
+        });
+        this.fileReferenceInliner = new FileReferenceInliner({
+            maxInlineBytes: Number(process.env.FILES_INLINE_MAX_BYTES) || undefined,
+            logger: this.logger,
         });
 
         this.needsSwitchingAfterRequest = false;
@@ -341,7 +353,7 @@ class RequestHandler {
     }
 
     /** 记录「上传会话 / 文件 -> 账号」，供同一会话的后续请求与引用该文件的生成请求使用 */
-    _recordAffinityFromResponse({ proxyRequest, res, bodyBuffer }) {
+    _recordAffinityFromResponse({ proxyRequest, req = null, res, bodyBuffer }) {
         const affinity = this.uploadSessionAffinity;
         if (!affinity || !this.config.accountLoadBalancing) return;
         const authIndex = this.currentAuthIndex;
@@ -368,9 +380,152 @@ class RequestHandler {
                         `(${proxyRequest.method} ${proxyRequest.path}).`
                 );
             }
+
         } catch (error) {
             this.logger.warn(`[Affinity] Failed to record affinity binding: ${error.message}`);
         }
+    }
+
+    /** PATCH(file-inline): 与负载均衡无关的上传文件字节缓存维护（DELETE 清理 / finalize 落盘） */
+    _recordUploadedFileCache({ proxyRequest, req = null, bodyBuffer }) {
+        const store = this.uploadedFileStore;
+        if (!store || !store.enabled) return;
+        try {
+            const method = String(proxyRequest?.method || "").toUpperCase();
+            if (method === "DELETE") {
+                const deletedId = UploadSessionAffinity.extractFileIdFromPath(proxyRequest.path || "");
+                if (deletedId) store.remove(deletedId);
+                return;
+            }
+            const command = String(req?.get?.("x-goog-upload-command") || "").toLowerCase();
+            if (!command.includes("finalize")) return;
+            const uploadSessionId = UploadSessionAffinity.extractUploadSessionId({
+                queryParams: req?.query,
+                rawUrl: req?.originalUrl || req?.url || "",
+            });
+            if (!uploadSessionId) return;
+            const fileIds = UploadSessionAffinity.extractFileIds(bodyBuffer);
+            if (!fileIds.length) return;
+
+            let expectedSize = null;
+            let mimeType = String(req?.get?.("x-goog-upload-header-content-type") || "") || null;
+            try {
+                const parsed = JSON.parse(Buffer.from(bodyBuffer).toString("utf8"));
+                const fileObject = parsed && parsed.file ? parsed.file : parsed;
+                if (Number.isFinite(fileObject?.sizeBytes)) expectedSize = fileObject.sizeBytes;
+                if (typeof fileObject?.mimeType === "string") mimeType = fileObject.mimeType;
+            } catch (e) {
+                /* 响应不是 JSON 时忽略 */
+            }
+            for (const fileId of fileIds) {
+                const result = store.commitSession(uploadSessionId, fileId, { expectedSize, mimeType });
+                if (result.ok) {
+                    this.logger.info(
+                        `[FileInline] 已缓存上传文件 ${fileId}（${(result.size / 1048576).toFixed(2)} MB），生成请求将自动内联。`
+                    );
+                } else {
+                    this.logger.warn(`[FileInline] 文件 ${fileId} 字节缓存失败: ${result.reason}`);
+                }
+            }
+        } catch (error) {
+            this.logger.warn(`[FileInline] 维护上传文件缓存失败: ${error.message}`);
+        }
+    }
+
+    // PATCH(file-inline): 缓存上传分块字节。
+    _captureUploadChunk(req) {
+        const store = this.uploadedFileStore;
+        if (!store || !store.enabled) return;
+        try {
+            const command = String(req.get?.("x-goog-upload-command") || "").toLowerCase();
+            if (!command.includes("upload")) return;
+            const sessionId = UploadSessionAffinity.extractUploadSessionId({
+                queryParams: req.query,
+                rawUrl: req.originalUrl || req.url || "",
+            });
+            const body = req.rawBody;
+            if (!sessionId || !body || !body.length) return;
+            const rawOffset = Number(req.get?.("x-goog-upload-offset"));
+            const offset = Number.isFinite(rawOffset) && rawOffset >= 0 ? rawOffset : 0;
+            store.appendChunk(sessionId, offset, body);
+        } catch (error) {
+            this.logger.warn(`[FileInline] 缓存上传分块失败: ${error.message}`);
+        }
+    }
+
+    // PATCH(file-inline): 把已缓存的上传文件字节内联进生成请求（同步、幂等，可在重试中重复调用）。
+    _applyFileReferenceInlining(proxyRequest) {
+        const inliner = this.fileReferenceInliner;
+        const store = this.uploadedFileStore;
+        if (!inliner || !store || !store.enabled || !proxyRequest) return { ok: true };
+
+        // 生成类请求把 body 放在 proxyRequest.body（JSON 字符串），其他请求用 body_b64。
+        const useBase64Field = Boolean(proxyRequest.body_b64);
+        const rawBody = useBase64Field ? proxyRequest.body_b64 : proxyRequest.body;
+        if (!rawBody || typeof rawBody !== "string") return { ok: true };
+
+        let body;
+        try {
+            body = JSON.parse(useBase64Field ? Buffer.from(rawBody, "base64").toString("utf8") : rawBody);
+        } catch (error) {
+            return { ok: true };
+        }
+        const references = inliner.findReferences(body);
+        if (!references.length) return { ok: true };
+
+        let totalBytes = 0;
+        for (const reference of references) {
+            const entry = store.getEntry(reference.fileId);
+            if (!entry) continue;
+            totalBytes += entry.size;
+            if (totalBytes > inliner.maxInlineBytes) {
+                const limitMiB = (inliner.maxInlineBytes / 1048576).toFixed(0);
+                return {
+                    ok: false,
+                    error: {
+                        message:
+                            `文件过大：该反向代理无法用 Files API 引用（上游会 403），只能内联传输，` +
+                            `上限 ${limitMiB} MB，当前请求合计 ${(totalBytes / 1048576).toFixed(1)} MB。请压缩或截短视频后重试。`,
+                        status: 413,
+                        skipAccountSwitch: true,
+                        fileIds: references.map(item => item.fileId),
+                    },
+                };
+            }
+        }
+
+        const stats = inliner.replaceReferences(body, references, fileId => {
+            const entry = store.getEntry(fileId);
+            if (!entry) return null;
+            const buffer = store.readBuffer(fileId);
+            if (!buffer) return null;
+            return { data: buffer.toString("base64"), mimeType: entry.mimeType, bytes: buffer.length };
+        });
+
+        if (!stats.replaced) {
+            this.logger.warn(
+                `[FileInline] 请求引用了 ${references.length} 个文件，但本地没有缓存字节，无法内联：${references
+                    .map(item => item.fileId)
+                    .join(", ")}`
+            );
+            return { ok: true };
+        }
+
+        const nextBody = Buffer.from(JSON.stringify(body), "utf8");
+        if (useBase64Field) {
+            proxyRequest.body_b64 = nextBody.toString("base64");
+        } else {
+            proxyRequest.body = nextBody.toString("utf8");
+        }
+        if (proxyRequest.headers && typeof proxyRequest.headers === "object") {
+            for (const key of Object.keys(proxyRequest.headers)) {
+                if (key.toLowerCase() === "content-length") proxyRequest.headers[key] = String(nextBody.length);
+            }
+        }
+        this.logger.info(
+            `[FileInline] 已把 ${stats.replaced} 个文件引用内联为 base64（${(stats.bytes / 1048576).toFixed(2)} MB，账号 #${this.currentAuthIndex}）。`
+        );
+        return { ok: true, stats };
     }
 
     async _withAccountLease(req, res, callback) {
@@ -1362,6 +1517,8 @@ class RequestHandler {
 
     // Process File Upload requests
     async processUploadRequest(req, res) {
+        // PATCH(file-inline): 缓存上传分块字节，供后续生成请求内联使用。
+        this._captureUploadChunk(req);
         const requestId = this._generateRequestId();
         this.logger.info(`[Upload] Processing upload request ${req.method} ${req.path}, request ID: ${requestId}`);
         this._startTrackedRequest(requestId, req, {
@@ -3498,7 +3655,9 @@ class RequestHandler {
             this._setResponseHeaders(res, headerMessage, req);
 
             // PATCH(upload-affinity): 记录上传会话/文件与账号的绑定，供后续请求回到同一账号。
-            this._recordAffinityFromResponse({ proxyRequest, res, bodyBuffer: fullBodyBuffer });
+            this._recordAffinityFromResponse({ proxyRequest, req, res, bodyBuffer: fullBodyBuffer });
+            // PATCH(file-inline): 维护上传文件字节缓存。
+            this._recordUploadedFileCache({ proxyRequest, req, bodyBuffer: fullBodyBuffer });
 
             // Ensure Content-Type is set (Express defaults Buffer to application/octet-stream)
             if (!res.get("Content-Type")) {
@@ -3552,6 +3711,12 @@ class RequestHandler {
     }
 
     async _executeRequestWithRetries(proxyRequest, messageQueue) {
+        // PATCH(file-inline): 把请求体里对已上传文件的引用换成内联 base64（上游对 Files API 引用会 403）。
+        const inlineResult = this._applyFileReferenceInlining(proxyRequest);
+        if (!inlineResult.ok) {
+            return { success: false, error: inlineResult.error, queue: messageQueue, message: null };
+        }
+
         let lastError = null;
         let currentQueue = messageQueue;
         const totalDeadline = this.config.accountLoadBalancing
@@ -4739,6 +4904,8 @@ class RequestHandler {
     }
 
     _forwardRequest(proxyRequest, authIndex = this.currentAuthIndex) {
+        // PATCH(file-inline): 所有转发路径（含流式直转与重试）都在这里统一内联已上传文件。
+        this._applyFileReferenceInlining(proxyRequest);
         const connection = this.connectionRegistry.getConnectionByAuth(authIndex);
         if (connection) {
             this.logger.debug(
