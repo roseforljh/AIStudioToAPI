@@ -876,7 +876,8 @@
                                         class="btn-switch"
                                         :class="{
                                             'is-active': item.index === state.currentAuthIndex,
-                                            'is-fast': item.hasContext && item.index !== state.currentAuthIndex,
+                                            'is-callable': item.isActive && item.index !== state.currentAuthIndex,
+                                            'is-fast': item.hasContext && !item.isActive && item.index !== state.currentAuthIndex,
                                         }"
                                         :disabled="isBusy || item.index === state.currentAuthIndex"
                                         :title="
@@ -5694,6 +5695,11 @@ watchEffect(() => {
             color: @success-color;
             opacity: 1 !important;
             cursor: not-allowed;
+        }
+
+        &.btn-switch.is-callable {
+            color: @success-color;
+            border-color: @success-color;
         }
 
         &.btn-switch.is-fast {

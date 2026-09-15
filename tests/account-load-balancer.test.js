@@ -245,3 +245,56 @@ test("keeps the leased account isolated across concurrent async request contexts
     ]);
     assert.deepEqual(observed, [10, 20]);
 });
+
+test("honours a preferred account so affinity-bound requests stay on one account", async () => {
+    const { balancer } = createBalancer({
+        acquireTimeoutMs: 200,
+        connected: [0, 1, 2],
+        maxConcurrentRequests: 3,
+    });
+    const lease = await balancer.acquire({ preferredAuthIndex: 2 });
+    assert.equal(lease.authIndex, 2);
+    lease.release();
+
+    const again = await balancer.acquire({ preferredAuthIndex: 2 });
+    assert.equal(again.authIndex, 2);
+    again.release();
+
+    const notPreferred = await balancer.acquire();
+    assert.notEqual(notPreferred.authIndex, 2);
+    notPreferred.release();
+});
+
+test("waits for the preferred account instead of silently switching away", async () => {
+    const { balancer } = createBalancer({
+        acquireTimeoutMs: 200,
+        connected: [0, 1],
+        maxConcurrentRequests: 2,
+        maxConcurrentPerAccount: 1,
+    });
+    const busy = await balancer.acquire({ preferredAuthIndex: 1 });
+    assert.equal(busy.authIndex, 1);
+
+    // 账号 #1 已占满：偏好请求应排队等待，而不是被分到 #0。
+    const waiting = balancer.acquire({ preferredAuthIndex: 1 });
+    let resolvedAuthIndex = null;
+    waiting.then(lease => {
+        resolvedAuthIndex = lease.authIndex;
+        lease.release();
+    });
+    await new Promise(resolve => setTimeout(resolve, 30));
+    assert.equal(resolvedAuthIndex, null, "must not fall back to another account while the preferred one is busy");
+
+    busy.release();
+    await new Promise(resolve => setTimeout(resolve, 30));
+    assert.equal(resolvedAuthIndex, 1);
+});
+
+test("ignores a preferred account that is excluded or cooling down", async () => {
+    const { balancer } = createBalancer({ acquireTimeoutMs: 100, connected: [0, 1], maxConcurrentRequests: 2 });
+    balancer.markCooldown(1, 403);
+    const lease = await balancer.acquire({ preferredAuthIndex: 1 });
+    assert.equal(lease.authIndex, 0);
+    lease.release();
+});
+

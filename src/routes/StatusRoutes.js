@@ -1066,6 +1066,15 @@ class StatusRoutes {
         const allLogs = this.logger.logBuffer || [];
         const displayLogs = allLogs.slice(-limit);
         const accountNameMap = authSource.accountNameMap;
+        // PATCH(active/standby split): mark which accounts are ACTIVE (callable)
+        let activeIndexSet = new Set();
+        try {
+            if (browserManager && typeof browserManager.getActiveCallableIndices === "function") {
+                activeIndexSet = new Set(browserManager.getActiveCallableIndices());
+            }
+        } catch (e) {
+            activeIndexSet = new Set();
+        }
         const accountDetails = initialIndices.map(index => {
             const isInvalid = invalidIndices.includes(index);
             const name = isInvalid ? null : accountNameMap.get(index) || null;
@@ -1077,7 +1086,7 @@ class StatusRoutes {
 
             const hasContext = browserManager.contexts.has(index);
 
-            return { canonicalIndex, hasContext, index, isDuplicate, isExpired, isInvalid, isRotation, name };
+            return { canonicalIndex, hasContext, index, isActive: activeIndexSet.has(index), isDuplicate, isExpired, isInvalid, isRotation, name };
         });
 
         const currentAuthIndex = requestHandler.currentAuthIndex;

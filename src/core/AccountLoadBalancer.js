@@ -51,7 +51,13 @@ class AccountLoadBalancer {
         return new Set([exclude]);
     }
 
-    _selectAuthIndex(exclude) {
+    _normalizePreferredAuthIndex(value) {
+        if (value === undefined || value === null || value === "") return null;
+        const authIndex = Number(value);
+        return Number.isInteger(authIndex) && authIndex >= 0 ? authIndex : null;
+    }
+
+    _selectAuthIndex(exclude, preferredAuthIndex = null, options = {}) {
         const excluded = this._normalizeExcluded(exclude);
         const now = this.now();
         const eligible = [...new Set(this.getEligibleAuthIndices())]
@@ -59,16 +65,37 @@ class AccountLoadBalancer {
             .filter(authIndex => !excluded.has(authIndex))
             .map(authIndex => ({ authIndex, state: this._getState(authIndex) }))
             .filter(({ state }) => state.cooldownUntil <= now)
-            .filter(({ state }) => state.activeRequests < this.maxConcurrentPerAccount)
-            .sort((a, b) => {
-                if (a.state.activeRequests !== b.state.activeRequests) {
-                    return a.state.activeRequests - b.state.activeRequests;
-                }
-                if (a.state.lastAssignedSequence !== b.state.lastAssignedSequence) {
-                    return a.state.lastAssignedSequence - b.state.lastAssignedSequence;
-                }
-                return a.authIndex - b.authIndex;
-            });
+            .filter(({ state }) => state.activeRequests < this.maxConcurrentPerAccount);
+
+        // 亲和性优先：上传会话 / 文件归属要求回到创建它的账号。
+        const preferred = this._normalizePreferredAuthIndex(preferredAuthIndex);
+        if (preferred !== null) {
+            const match = eligible.find(({ authIndex }) => authIndex === preferred);
+            if (match) return match.authIndex;
+
+            if (options.requirePreferred) {
+                // 粘性请求：只有这一个账号是正确的（换号 = 上游 500 INTERNAL），
+                // 因此宁可排队等待也不回退到别的账号。
+                return null;
+            }
+
+            const preferredState = this._getState(preferred);
+            const preferredEligible = [...new Set(this.getEligibleAuthIndices())].includes(preferred);
+            if (preferredEligible && !excluded.has(preferred) && preferredState.cooldownUntil <= now) {
+                // 账号本身健康、只是并发槽位被占满：宁愿排队等待，也不要换号。
+                return null;
+            }
+        }
+
+        eligible.sort((a, b) => {
+            if (a.state.activeRequests !== b.state.activeRequests) {
+                return a.state.activeRequests - b.state.activeRequests;
+            }
+            if (a.state.lastAssignedSequence !== b.state.lastAssignedSequence) {
+                return a.state.lastAssignedSequence - b.state.lastAssignedSequence;
+            }
+            return a.authIndex - b.authIndex;
+        });
 
         return eligible.length > 0 ? eligible[0].authIndex : null;
     }
@@ -85,6 +112,15 @@ class AccountLoadBalancer {
             return Math.max(1, Math.min(eligibleCount, Math.floor(this.maxConcurrentRequests)));
         }
         return Math.max(1, Math.floor(eligibleCount / 2));
+    }
+
+    isCoolingDown(authIndex) {
+        try {
+            const state = this._getState(authIndex);
+            return !!(state && state.cooldownUntil > this.now());
+        } catch (e) {
+            return false;
+        }
     }
 
     _getActiveRequestCount() {
@@ -158,9 +194,13 @@ class AccountLoadBalancer {
 
     acquire(options = {}) {
         const exclude = this._normalizeExcluded(options.exclude);
+        const preferredAuthIndex = this._normalizePreferredAuthIndex(options.preferredAuthIndex);
+        const requirePreferred = options.requirePreferred === true;
         const globalLimit = this._getGlobalConcurrencyLimit();
         const authIndex =
-            globalLimit > 0 && this._getActiveRequestCount() < globalLimit ? this._selectAuthIndex(exclude) : null;
+            globalLimit > 0 && this._getActiveRequestCount() < globalLimit
+                ? this._selectAuthIndex(exclude, preferredAuthIndex, { requirePreferred })
+                : null;
         if (authIndex !== null) {
             this._reserve(authIndex);
             return Promise.resolve(this._createLease(authIndex));
@@ -171,7 +211,16 @@ class AccountLoadBalancer {
         const timeoutMs = Math.max(1, Number(options.timeoutMs) || this.acquireTimeoutMs);
 
         return new Promise((resolve, reject) => {
-            const waiter = { abortHandler: null, exclude, reject, resolve, signal, timeoutId: null };
+            const waiter = {
+                abortHandler: null,
+                exclude,
+                preferredAuthIndex,
+                requirePreferred,
+                reject,
+                resolve,
+                signal,
+                timeoutId: null,
+            };
             const cleanup = () => {
                 if (waiter.timeoutId) clearTimeout(waiter.timeoutId);
                 if (waiter.signal && waiter.abortHandler) {
@@ -212,7 +261,9 @@ class AccountLoadBalancer {
         for (const waiter of [...this.waiters]) {
             const globalLimit = this._getGlobalConcurrencyLimit();
             if (globalLimit <= 0 || this._getActiveRequestCount() >= globalLimit) break;
-            const authIndex = this._selectAuthIndex(waiter.exclude);
+            const authIndex = this._selectAuthIndex(waiter.exclude, waiter.preferredAuthIndex, {
+                requirePreferred: waiter.requirePreferred === true,
+            });
             if (authIndex === null) continue;
             this._removeWaiter(waiter);
             waiter.cleanup();

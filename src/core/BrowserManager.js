@@ -66,6 +66,12 @@ class BrowserManager {
         this._isSystemBusyProvider = null;
         this.pendingContextClosures = new Map();
 
+        // PATCH(balance+backfill): accounts that recently hit a limit are ranked last
+        // when the pool is rebuilt, so fresh accounts take their slots while
+        // account load balancing stays enabled.
+        this._deprioritizedUntil = new Map();
+        this._deprioritizeRebuildTimer = null;
+
         // Background wakeup service status (instance-level, tracks this.page)
         // Prevents multiple BackgroundWakeup instances from running simultaneously
         this.backgroundWakeupRunning = false;
@@ -1913,6 +1919,112 @@ class BrowserManager {
     }
 
     /**
+     * PATCH(balance+backfill): mark an account as deprioritized (limit / cooldown).
+     * Deprioritized accounts rank last on pool rebuild so fresh accounts fill their
+     * slots, while load balancing keeps running across the existing contexts.
+     */
+    deprioritizeAccount(authIndex, durationMs) {
+        try {
+            if (!Number.isInteger(authIndex) || authIndex < 0) return;
+            const ms = Math.max(1000, Number(durationMs) || 0);
+            const until = Date.now() + ms;
+            if ((this._deprioritizedUntil.get(authIndex) || 0) >= until) return;
+            this._deprioritizedUntil.set(authIndex, until);
+            this.logger.info(
+                `[ContextPool] Account #${authIndex} deprioritized for ${Math.round(ms / 1000)}s (limit/cooldown) - pool will backfill with fresh accounts.`
+            );
+            const t = setTimeout(() => {
+                if (!this.isAccountDeprioritized(authIndex)) this._scheduleDeprioritizeRebuild();
+            }, ms + 2000);
+            if (t.unref) t.unref();
+            this._scheduleDeprioritizeRebuild();
+        } catch (err) {
+            this.logger.warn(`[ContextPool] deprioritizeAccount failed: ${err.message}`);
+        }
+    }
+
+    isAccountDeprioritized(authIndex) {
+        const until = this._deprioritizedUntil.get(authIndex);
+        if (!until) return false;
+        if (until <= Date.now()) {
+            this._deprioritizedUntil.delete(authIndex);
+            return false;
+        }
+        return true;
+    }
+
+    _scheduleDeprioritizeRebuild() {
+        if (this._deprioritizeRebuildTimer) return;
+        this._deprioritizeRebuildTimer = setTimeout(() => {
+            this._deprioritizeRebuildTimer = null;
+            this.rebalanceContextPool().catch((err) => {
+                this.logger.error(`[ContextPool] Backfill rebalance failed: ${err.message}`);
+            });
+        }, 5000);
+        if (this._deprioritizeRebuildTimer.unref) this._deprioritizeRebuildTimer.unref();
+    }
+
+    /**
+     * PATCH(active/standby split): pick the ACTIVE (callable) half of the warm pool.
+     * Odd counts take the smaller half. Deprioritized (limit-hit) accounts rank last.
+     * The remaining warm contexts stay as hot standby and are NOT called.
+     */
+    selectActiveAuthIndices(readyIndices) {
+        const ready = [...new Set((readyIndices || []).filter((i) => Number.isInteger(i) && i >= 0))];
+        if (ready.length <= 1) return ready;
+        const activeCount = Math.max(1, Math.floor(ready.length / 2));
+        let rotation = [];
+        try {
+            rotation = this.authSource.getRotationIndices() || [];
+        } catch (e) {
+            rotation = [];
+        }
+        const rank = (idx) => {
+            const pos = rotation.indexOf(idx);
+            return pos >= 0 ? pos : Number.MAX_SAFE_INTEGER;
+        };
+        const ordered = [...ready].sort((a, b) => {
+            const ua = this._isAccountUnavailable(a) ? 1 : 0;
+            const ub = this._isAccountUnavailable(b) ? 1 : 0;
+            if (ua !== ub) return ua - ub;
+            return rank(a) - rank(b) || a - b;
+        });
+        return ordered.slice(0, activeCount);
+    }
+
+    setAccountAvailabilityChecker(fn) {
+        this._accountAvailabilityChecker = typeof fn === "function" ? fn : null;
+    }
+
+    _isAccountUnavailable(idx) {
+        try {
+            if (this._accountAvailabilityChecker && this._accountAvailabilityChecker(idx)) return true;
+        } catch (e) {
+            /* ignore */
+        }
+        return this.isAccountDeprioritized(idx);
+    }
+
+    getActiveCallableIndices() {
+        const ready = [];
+        try {
+            const reg = this.connectionRegistry;
+            if (reg && typeof reg.getAllConnections === "function") {
+                for (const [idx, conn] of reg.getAllConnections().entries()) {
+                    if (conn && conn.readyState === 1 && this.contexts.has(idx)) ready.push(idx);
+                }
+            }
+        } catch (e) {
+            /* ignore */
+        }
+        try {
+            return this.selectActiveAuthIndices(ready);
+        } catch (e) {
+            return ready;
+        }
+    }
+
+    /**
      * Rebalance context pool after account changes
      * Removes excess contexts and starts missing ones in background
      */
@@ -1939,7 +2051,13 @@ class BrowserManager {
             const nonExpiredAvailable = this.authSource.availableIndices.filter(idx => !this.authSource.isExpired(idx));
             targets = new Set(nonExpiredAvailable);
         } else {
-            targets = new Set(ordered.slice(0, maxContexts));
+            // PATCH(balance+backfill): rank deprioritized (limit-hit) accounts last
+            const ranked = [
+                ...ordered.filter((idx) => !this.isAccountDeprioritized(idx)),
+                ...ordered.filter((idx) => this.isAccountDeprioritized(idx)),
+            ];
+            targets = new Set(ranked.slice(0, maxContexts));
+
         }
 
         for (const idx of targets) {

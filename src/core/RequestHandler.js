@@ -13,6 +13,8 @@ const AuthSwitcher = require("../auth/AuthSwitcher");
 const FormatConverter = require("./FormatConverter");
 const AccountLoadBalancer = require("./AccountLoadBalancer");
 const AccountRequestContext = require("./AccountRequestContext");
+const UploadSessionAffinity = require("./UploadSessionAffinity");
+const path = require("path");
 const { isUserAbortedError } = require("../utils/CustomErrors");
 const { QueueClosedError, QueueTimeoutError } = require("../utils/MessageQueue");
 
@@ -45,17 +47,51 @@ class RequestHandler {
             cooldownByStatus: { 403: 300000, 429: 60000, 503: 30000 },
             getEligibleAuthIndices: () => {
                 if (!config.accountLoadBalancing) return [this.authSwitcher.currentAuthIndex];
-                return [...this.connectionRegistry.getAllConnections().entries()]
+                const ready = [...this.connectionRegistry.getAllConnections().entries()]
                     .filter(([, connection]) => connection?.readyState === 1)
                     .map(([authIndex]) => authIndex)
                     .filter(authIndex => this.browserManager.contexts.has(authIndex));
+                // PATCH(active/standby split): only the ACTIVE half is callable;
+                // the rest stay warm as hot standby.
+                if (this.browserManager && typeof this.browserManager.selectActiveAuthIndices === "function") {
+                    return this.browserManager.selectActiveAuthIndices(ready);
+                }
+                return ready;
             },
             logger,
             maxConcurrentPerAccount: config.accountMaxConcurrentRequests,
-            maxConcurrentRequests: config.accountMaxConcurrentRequestsTotal,
+            maxConcurrentRequests: (eligibleCount) => {
+                const active = Math.max(1, Number(eligibleCount) || 1);
+                const cfg = Number(config.accountMaxConcurrentRequestsTotal);
+                return Number.isFinite(cfg) && cfg > 0 ? Math.min(active, cfg) : active;
+            },
         });
+        // PATCH(active/standby split): let the pool know which accounts are temporarily
+        // unusable (cooling down) so the ACTIVE window can slide onto standby accounts.
+        try {
+            if (this.browserManager && typeof this.browserManager.setAccountAvailabilityChecker === "function") {
+                this.browserManager.setAccountAvailabilityChecker((idx) => {
+                    try {
+                        return this.accountLoadBalancer.isCoolingDown(idx);
+                    } catch (e) {
+                        return false;
+                    }
+                });
+            }
+        } catch (e) {
+            /* ignore */
+        }
+
         this.connectionRegistry.on("connectionAdded", () => this.accountLoadBalancer.notifyAvailabilityChanged());
         this.connectionRegistry.on("connectionRemoved", () => this.accountLoadBalancer.notifyAvailabilityChanged());
+
+        // PATCH(upload-affinity): Google 的可续传上传会话（Files API）绑定在创建它的
+        // 那个 Google 账号上，跨账号 finalize 会被上游直接判为 500 INTERNAL。
+        // 这里记录「上传会话 / 文件 -> 账号」的粘性映射，让后续请求回到同一账号。
+        this.uploadSessionAffinity = new UploadSessionAffinity({
+            filePath: path.join(process.cwd(), "data", "upload-affinity.json"),
+            logger,
+        });
 
         this.needsSwitchingAfterRequest = false;
 
@@ -253,10 +289,96 @@ class RequestHandler {
         this._markTrackedResponseError(res, message, statusCode);
     }
 
+    // === Upload / file affinity (PATCH(upload-affinity)) ===
+
+    _extractAffinityPin({ queryParams = null, rawUrl = "", requestPath = "", bodyBuffer = null } = {}) {
+        const affinity = this.uploadSessionAffinity;
+        if (!affinity || !this.config.accountLoadBalancing) return null;
+        try {
+            const uploadSessionId = UploadSessionAffinity.extractUploadSessionId({ queryParams, rawUrl });
+            const fileIds = [];
+            const pathFileId = UploadSessionAffinity.extractFileIdFromPath(requestPath);
+            if (pathFileId) fileIds.push(pathFileId);
+            if (bodyBuffer && bodyBuffer.length) {
+                for (const fileId of UploadSessionAffinity.extractFileIds(bodyBuffer)) {
+                    if (!fileIds.includes(fileId)) fileIds.push(fileId);
+                }
+            }
+            if (!uploadSessionId && fileIds.length === 0) return null;
+            return affinity.resolvePinnedAuthIndex({ uploadSessionId, fileIds });
+        } catch (error) {
+            this.logger.warn(`[Affinity] Failed to resolve affinity pin: ${error.message}`);
+            return null;
+        }
+    }
+
+    _getRequestAffinityPin(req) {
+        if (!req) return null;
+        const rawUrl = req.originalUrl || req.url || "";
+        return this._extractAffinityPin({
+            queryParams: req.query || null,
+            rawUrl,
+            requestPath: (req.path || rawUrl || "").split("?")[0],
+            bodyBuffer: Buffer.isBuffer(req.rawBody) ? req.rawBody : null,
+        });
+    }
+
+    _getProxyRequestAffinityPin(proxyRequest) {
+        if (!proxyRequest) return null;
+        let bodyBuffer = null;
+        if (typeof proxyRequest.body_b64 === "string" && proxyRequest.body_b64) {
+            bodyBuffer = Buffer.from(proxyRequest.body_b64, "base64");
+        } else if (typeof proxyRequest.body === "string" && proxyRequest.body) {
+            bodyBuffer = Buffer.from(proxyRequest.body, "utf8");
+        }
+        const rawPath = proxyRequest.path || "";
+        return this._extractAffinityPin({
+            queryParams: proxyRequest.query_params || null,
+            rawUrl: rawPath,
+            requestPath: rawPath.split("?")[0],
+            bodyBuffer,
+        });
+    }
+
+    /** 记录「上传会话 / 文件 -> 账号」，供同一会话的后续请求与引用该文件的生成请求使用 */
+    _recordAffinityFromResponse({ proxyRequest, res, bodyBuffer }) {
+        const affinity = this.uploadSessionAffinity;
+        if (!affinity || !this.config.accountLoadBalancing) return;
+        const authIndex = this.currentAuthIndex;
+        if (!Number.isInteger(authIndex) || authIndex < 0) return;
+        try {
+            const headerValue = typeof res?.getHeader === "function" ? res.getHeader("x-goog-upload-url") : null;
+            const uploadUrl = Array.isArray(headerValue) ? headerValue[0] : headerValue;
+            const sessionId = uploadUrl
+                ? UploadSessionAffinity.extractUploadSessionId({ rawUrl: String(uploadUrl) })
+                : null;
+            if (sessionId) {
+                affinity.bindUploadSession(sessionId, authIndex);
+                this.logger.info(
+                    `[Affinity] Upload session pinned to account #${authIndex} for ${proxyRequest.method} ${proxyRequest.path}.`
+                );
+            }
+            const fileIds = UploadSessionAffinity.extractFileIds(bodyBuffer);
+            for (const fileId of fileIds) {
+                affinity.bindFile(fileId, authIndex);
+            }
+            if (fileIds.length > 0) {
+                this.logger.info(
+                    `[Affinity] File(s) ${fileIds.join(", ")} owned by account #${authIndex} ` +
+                        `(${proxyRequest.method} ${proxyRequest.path}).`
+                );
+            }
+        } catch (error) {
+            this.logger.warn(`[Affinity] Failed to record affinity binding: ${error.message}`);
+        }
+    }
+
     async _withAccountLease(req, res, callback) {
         if (!this.config.accountLoadBalancing || this.accountRequestContext.getLease()) {
             return callback();
         }
+
+        const affinityPin = this._getRequestAffinityPin(req);
 
         const controller = new AbortController();
         const abort = () => controller.abort();
@@ -271,6 +393,8 @@ class RequestHandler {
             lease = await this.accountLoadBalancer.acquire({
                 signal: controller.signal,
                 timeoutMs: acquireTimeoutMs,
+                preferredAuthIndex: affinityPin ? affinityPin.authIndex : null,
+                requirePreferred: Boolean(affinityPin),
             });
             const assignedAuthIndex = lease.authIndex;
             if (
@@ -282,8 +406,16 @@ class RequestHandler {
                 this.accountLoadBalancer.notifyAvailabilityChanged();
                 throw new Error(`Assigned account #${assignedAuthIndex} became unavailable before request start.`);
             }
+            // PATCH(upload-affinity): 把粘性绑定挂到租约上，重试逻辑据此拒绝换号。
+            if (affinityPin) {
+                lease.pinnedAuthIndex = affinityPin.authIndex;
+                lease.affinitySource = affinityPin.source;
+            }
             this.logger.info(
-                `[LoadBalancer] Assigned request ${req.method} ${req.path} to account #${lease.authIndex}`
+                `[LoadBalancer] Assigned request ${req.method} ${req.path} to account #${lease.authIndex}` +
+                    (affinityPin
+                        ? ` (affinity: ${affinityPin.source} -> account #${affinityPin.authIndex})`
+                        : "")
             );
             return await this.accountRequestContext.run({ lease }, callback);
         } catch (error) {
@@ -312,6 +444,14 @@ class RequestHandler {
     async _moveCurrentAccountLease(errorDetails, attemptedAuthIndices) {
         const lease = this.accountRequestContext.getLease();
         if (!lease) return false;
+        // PATCH(upload-affinity): 上传会话 / 文件所属账号是唯一正确的账号，禁止换号。
+        if (Number.isInteger(lease.pinnedAuthIndex) && lease.pinnedAuthIndex >= 0) {
+            this.logger.warn(
+                `[Affinity] Refusing to move the lease away from account #${lease.pinnedAuthIndex} ` +
+                    `(${lease.affinitySource || "affinity"} pin) after ${errorDetails?.status || "an error"}.`
+            );
+            return false;
+        }
         const sourceAuthIndex = lease.authIndex;
         attemptedAuthIndices.add(sourceAuthIndex);
         await lease.move({
@@ -746,12 +886,27 @@ class RequestHandler {
         return Math.max(configured, eligibleAccounts);
     }
 
-    _createImmediateSwitchTracker(initialAuthIndex = this.currentAuthIndex) {
+    _createImmediateSwitchTracker(initialAuthIndex = this.currentAuthIndex, options = {}) {
         const attemptedAuthIndices = new Set();
         if (Number.isInteger(initialAuthIndex) && initialAuthIndex >= 0) {
             attemptedAuthIndices.add(initialAuthIndex);
         }
-        return { attemptedAuthIndices };
+        const pinnedFromOption = Number.isInteger(options.pinnedAuthIndex) ? options.pinnedAuthIndex : null;
+        const pinnedFromLease = this.accountRequestContext.getLease?.()?.pinnedAuthIndex;
+        const pinnedAuthIndex = pinnedFromOption !== null
+            ? pinnedFromOption
+            : Number.isInteger(pinnedFromLease)
+              ? pinnedFromLease
+              : null;
+        return { attemptedAuthIndices, pinnedAuthIndex };
+    }
+
+    /**
+     * PATCH(upload-affinity): 上传会话/文件所属的账号是「唯一正确」的账号，
+     * 换号必然被 Google 判为 500 INTERNAL，因此禁止切换并给出明确原因。
+     */
+    _isPinnedRequest(tracker) {
+        return Number.isInteger(tracker?.pinnedAuthIndex) && tracker.pinnedAuthIndex >= 0;
     }
 
     _getImmediateStatusRetryCloseReason(status) {
@@ -763,6 +918,20 @@ class RequestHandler {
             const status = Number(errorDetails?.status);
             if (this.config.immediateSwitchStatusCodes.includes(status)) {
                 this.accountLoadBalancer.markCooldown(this.currentAuthIndex, status);
+                // PATCH(balance+backfill): also deprioritize this account so the pool
+                // swaps in a fresh one instead of staying on a limited account.
+                try {
+                    let ms = 300000;
+                    const map = this.accountLoadBalancer && this.accountLoadBalancer.cooldownByStatus;
+                    if (map && typeof map.get === "function") {
+                        ms = map.get(status) || map.get(String(status)) || ms;
+                    }
+                    if (this.browserManager && typeof this.browserManager.deprioritizeAccount === "function") {
+                        this.browserManager.deprioritizeAccount(this.currentAuthIndex, ms);
+                    }
+                } catch (e) {
+                    this.logger.warn(`[LoadBalancer] deprioritize after ${status} failed: ${e.message}`);
+                }
             }
             return;
         }
@@ -771,6 +940,13 @@ class RequestHandler {
 
     async _performImmediateSwitchRetry(errorDetails, requestId, tracker) {
         if (this.config.accountLoadBalancing && this.accountRequestContext.getLease()) {
+            if (this._isPinnedRequest(tracker)) {
+                this.logger.warn(
+                    `[Affinity] Request #${requestId} is bound to account #${tracker.pinnedAuthIndex} ` +
+                        `(upload session / file owner); refusing to switch accounts after ${errorDetails.status}.`
+                );
+                return false;
+            }
             try {
                 return await this._moveCurrentAccountLease(errorDetails, tracker.attemptedAuthIndices);
             } catch (error) {
@@ -815,6 +991,13 @@ class RequestHandler {
         const hasCurrentAuth = Number.isInteger(currentAuthIndex) && currentAuthIndex >= 0;
 
         if (hasSourceAuth && hasCurrentAuth && sourceAuthIndex !== currentAuthIndex) {
+            if (this._isPinnedRequest(tracker)) {
+                this.logger.warn(
+                    `[Affinity] Request #${requestId} is bound to account #${tracker.pinnedAuthIndex}; ` +
+                        `ignoring ${errorDetails.status} reported by non-current account #${sourceAuthIndex} instead of retrying elsewhere.`
+                );
+                return false;
+            }
             const ready = await this._waitForSystemAndConnectionIfBusy(null, {
                 sendError: () => {},
             });
@@ -3314,6 +3497,9 @@ class RequestHandler {
 
             this._setResponseHeaders(res, headerMessage, req);
 
+            // PATCH(upload-affinity): 记录上传会话/文件与账号的绑定，供后续请求回到同一账号。
+            this._recordAffinityFromResponse({ proxyRequest, res, bodyBuffer: fullBodyBuffer });
+
             // Ensure Content-Type is set (Express defaults Buffer to application/octet-stream)
             if (!res.get("Content-Type")) {
                 res.type("application/json");
@@ -3520,12 +3706,18 @@ class RequestHandler {
                     retryAttempt < this.config.maxRetries
                 ) {
                     try {
-                        const moved = await this._moveCurrentAccountLease(
-                            errorPayload,
-                            immediateSwitchTracker.attemptedAuthIndices
-                        );
-                        if (moved) {
-                            const newAuthIndex = this.accountRequestContext.getLease()?.authIndex;
+                        // PATCH(upload-affinity): 粘性请求不能换号，直接在原账号上重试。
+                        const isPinnedRequest = this._isPinnedRequest(immediateSwitchTracker);
+                        const moved = isPinnedRequest
+                            ? false
+                            : await this._moveCurrentAccountLease(
+                                  errorPayload,
+                                  immediateSwitchTracker.attemptedAuthIndices
+                              );
+                        if (moved || isPinnedRequest) {
+                            const newAuthIndex = isPinnedRequest
+                                ? currentQueueAuthIndex
+                                : this.accountRequestContext.getLease()?.authIndex;
                             if (Number.isInteger(newAuthIndex) && newAuthIndex >= 0) {
                                 this._advanceProxyRequestAttempt(proxyRequest);
                                 currentQueue = this.connectionRegistry.createMessageQueue(
