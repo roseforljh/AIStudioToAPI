@@ -312,11 +312,20 @@ class RequestHandler {
             const pathFileId = UploadSessionAffinity.extractFileIdFromPath(requestPath);
             if (pathFileId) fileIds.push(pathFileId);
             if (bodyBuffer && bodyBuffer.length) {
-                for (const fileId of UploadSessionAffinity.extractFileIds(bodyBuffer)) {
-                    if (!fileIds.includes(fileId)) fileIds.push(fileId);
+                for (const id of UploadSessionAffinity.extractFileIds(bodyBuffer)) {
+                    if (!fileIds.includes(id)) fileIds.push(id);
                 }
             }
             if (!uploadSessionId && fileIds.length === 0) return null;
+            // PATCH(file-inline): 能被本地缓存内联的文件不需要粘在所属账号上——
+            // 粘性会阻止 403 换号，而部分账号对媒体请求会返回 403（实测）。
+            const allFilesInlinable =
+                fileIds.length > 0 &&
+                !uploadSessionId &&
+                this.uploadedFileStore &&
+                this.uploadedFileStore.enabled &&
+                fileIds.every(id => Boolean(this.uploadedFileStore.getEntry(id)));
+            if (allFilesInlinable) return null;
             return affinity.resolvePinnedAuthIndex({ uploadSessionId, fileIds });
         } catch (error) {
             this.logger.warn(`[Affinity] Failed to resolve affinity pin: ${error.message}`);
@@ -459,14 +468,45 @@ class RequestHandler {
         const store = this.uploadedFileStore;
         if (!inliner || !store || !store.enabled || !proxyRequest) return { ok: true };
 
-        // 生成类请求把 body 放在 proxyRequest.body（JSON 字符串），其他请求用 body_b64。
-        const useBase64Field = Boolean(proxyRequest.body_b64);
-        const rawBody = useBase64Field ? proxyRequest.body_b64 : proxyRequest.body;
-        if (!rawBody || typeof rawBody !== "string") return { ok: true };
+        // 上传分块（大体积二进制）永远不会带文件引用，直接跳过，避免无谓解码。
+        if (String(proxyRequest.path || "").startsWith("/upload/")) return { ok: true };
+
+        // 生成请求可能同时携带 body（JSON 文本）与 body_b64（base64 的同一 JSON）；
+        // 浏览器端实际读取 body_b64，所以优先改写它，并把 body 一起同步，避免客户端拿到旧体。
+        let bodyField = null;
+        let rawBody = null;
+        const plainBody = typeof proxyRequest.body === "string" ? proxyRequest.body : null;
+        if (typeof proxyRequest.body_b64 === "string" && proxyRequest.body_b64.length) {
+            let decoded = null;
+            try {
+                decoded = Buffer.from(proxyRequest.body_b64, "base64").toString("utf8");
+            } catch (error) {
+                decoded = null;
+            }
+            if (decoded && (decoded.includes("fileData") || decoded.includes("file_data"))) {
+                bodyField = "body_b64";
+                rawBody = decoded;
+            }
+        }
+        if (!bodyField && plainBody && (plainBody.includes("fileData") || plainBody.includes("file_data"))) {
+            bodyField = "body";
+            rawBody = plainBody;
+        }
+        if (!bodyField) {
+            const requestPath = String(proxyRequest.path || "");
+            if (
+                /generateContent/i.test(requestPath) &&
+                !plainBody &&
+                !proxyRequest.body_b64
+            ) {
+                this.logger.warn("[FileInline] 生成请求缺少可解析的请求体字段，文件引用可能未被内联。");
+            }
+            return { ok: true };
+        }
 
         let body;
         try {
-            body = JSON.parse(useBase64Field ? Buffer.from(rawBody, "base64").toString("utf8") : rawBody);
+            body = JSON.parse(rawBody);
         } catch (error) {
             return { ok: true };
         }
@@ -512,10 +552,15 @@ class RequestHandler {
         }
 
         const nextBody = Buffer.from(JSON.stringify(body), "utf8");
-        if (useBase64Field) {
+        // 两个字段都同步更新：客户端读 body_b64，但保持 body 一致可避免其他路径拿到旧体。
+        if (typeof proxyRequest.body_b64 === "string" && proxyRequest.body_b64.length) {
             proxyRequest.body_b64 = nextBody.toString("base64");
-        } else {
+        }
+        if (typeof proxyRequest.body === "string") {
             proxyRequest.body = nextBody.toString("utf8");
+        }
+        if (!proxyRequest.body_b64 && bodyField === "body_b64") {
+            proxyRequest.body_b64 = nextBody.toString("base64");
         }
         if (proxyRequest.headers && typeof proxyRequest.headers === "object") {
             for (const key of Object.keys(proxyRequest.headers)) {
@@ -525,6 +570,10 @@ class RequestHandler {
         this.logger.info(
             `[FileInline] 已把 ${stats.replaced} 个文件引用内联为 base64（${(stats.bytes / 1048576).toFixed(2)} MB，账号 #${this.currentAuthIndex}）。`
         );
+        if (process.env.FILE_INLINE_DEBUG === "1") {
+            const skeleton = JSON.stringify(body).replace(/"data":"[^"]*"/g, match => `"data":"<${match.length} chars>"`);
+            this.logger.info(`[FileInline][DEBUG] 改写后请求体(前400字符)=${skeleton.slice(0, 400)}`);
+        }
         return { ok: true, stats };
     }
 
@@ -4908,6 +4957,21 @@ class RequestHandler {
         this._applyFileReferenceInlining(proxyRequest);
         const connection = this.connectionRegistry.getConnectionByAuth(authIndex);
         if (connection) {
+            if (process.env.FILE_INLINE_DEBUG === "1" && /generateContent/i.test(String(proxyRequest.path || ""))) {
+                let wire = "";
+                try {
+                    wire = JSON.stringify({ event_type: "proxy_request", ...proxyRequest });
+                } catch (error) {
+                    wire = "";
+                }
+                this.logger.info(
+                    `[FileInline][WIRE] keys=${Object.keys(proxyRequest).join(",")} | bodyType=${typeof proxyRequest.body}` +
+                        ` | bodyLen=${typeof proxyRequest.body === "string" ? proxyRequest.body.length : -1}` +
+                        ` | b64Len=${typeof proxyRequest.body_b64 === "string" ? proxyRequest.body_b64.length : -1}` +
+                        ` | wireLen=${wire.length} | wireHasFileUri=${wire.includes("fileUri") || wire.includes("file_uri")}` +
+                        ` | wireHasInline=${wire.includes("inlineData") || wire.includes("inline_data")}`
+                );
+            }
             this.logger.debug(
                 `[Request] Forwarding request #${proxyRequest.request_id} via connection for authIndex=${authIndex}` +
                     ` (attempt=${proxyRequest.request_attempt_id})`
