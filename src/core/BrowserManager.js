@@ -9,6 +9,8 @@ const fs = require("fs");
 const path = require("path");
 const { firefox } = require("playwright");
 const os = require("os");
+const AccountPoolRotation = require("./AccountPoolRotation");
+const AccountHealth = require("./AccountHealth");
 
 const { parseProxyFromEnv } = require("../utils/ProxyUtils");
 const StickyProxyManager = require("../utils/StickyProxyManager");
@@ -70,6 +72,12 @@ class BrowserManager {
         // when the pool is rebuilt, so fresh accounts take their slots while
         // account load balancing stays enabled.
         this._deprioritizedUntil = new Map();
+        this._poolRotation = new AccountPoolRotation(path.join(process.cwd(), "data", "account-pool-rotation.json"), logger);
+        this._poolActive = new Set();
+        this.accountHealth = new AccountHealth();
+        this._poolBackfillPending = false;
+        this._poolRebalanceTask = null;
+        this._poolRebalanceAgain = false;
         this._deprioritizeRebuildTimer = null;
 
         // Background wakeup service status (instance-level, tracks this.page)
@@ -1379,6 +1387,7 @@ class BrowserManager {
      * @returns {Promise<{firstReady: number|null}>}
      */
     async preloadContextPool(startupOrder, maxContexts) {
+        if (this.config.accountLoadBalancing) startupOrder = this._poolRotation.order(startupOrder);
         const poolSize = maxContexts === 0 ? startupOrder.length : Math.min(maxContexts, startupOrder.length);
         this.logger.info(
             `🚀 [ContextPool] Starting pool preload (pool=${poolSize}, order=[${startupOrder.join(", ")}])...`
@@ -1420,6 +1429,7 @@ class BrowserManager {
 
             this.initializingContexts.add(authIndex);
             try {
+                if (this.config.accountLoadBalancing) this._poolRotation.attempted(authIndex);
                 this.logger.info(`[ContextPool] Initializing context #${authIndex}...`);
                 await this._initializeContext(authIndex);
                 firstReady = authIndex;
@@ -1453,6 +1463,7 @@ class BrowserManager {
             ordered.push(rotation[(startPos + i) % rotation.length]);
         }
 
+        if (this.config.accountLoadBalancing) ordered.splice(0, ordered.length, ...this._poolRotation.order(rotation));
         // Calculate how many more contexts we need to reach poolSize
         const needCount = poolSize - this.contexts.size;
         if (needCount > 0) {
@@ -1546,6 +1557,11 @@ class BrowserManager {
      * @param {number} maxPoolSize - Stop when this.contexts.size reaches this limit (0 = no limit)
      */
     async _preloadBackgroundContexts(indices, maxPoolSize = 0) {
+        if (this.config.accountLoadBalancing && this._backgroundPreloadTask) {
+            this._poolBackfillPending = true;
+            return;
+        }
+        this._poolBackfillPending = false;
         // If there's an existing background task, abort it and wait for it to finish
         await this.abortBackgroundPreload();
 
@@ -1564,6 +1580,10 @@ class BrowserManager {
                 // Only clear if this is still the current task
                 if (this._backgroundPreloadTask === currentTask) {
                     this._backgroundPreloadTask = null;
+                    if (this.config.accountLoadBalancing && this._poolBackfillPending) {
+                        this._poolBackfillPending = false;
+                        this._scheduleDeprioritizeRebuild();
+                    }
                 }
             });
     }
@@ -1616,9 +1636,9 @@ class BrowserManager {
         if (!this.pendingContextClosures.has(authIndex)) {
             return false;
         }
-        if (authIndex === this._currentAuthIndex) {
+        if (authIndex === this._currentAuthIndex && !this.isAccountDeprioritized(authIndex)) {
             this.logger.debug(
-                `[ContextPool] Skipping pending close for context #${authIndex} because it is active again as current.`
+                `[ContextPool] Skipping pending close for healthy current context #${authIndex}.`
             );
             return false;
         }
@@ -1640,7 +1660,7 @@ class BrowserManager {
             `[ContextPool] Closing deferred context #${authIndex} now that all queues are drained (reason: ${pendingReason}).`
         );
         await this.closeContext(authIndex);
-        if (this._isSystemBusy()) {
+        if (!this.config.accountLoadBalancing && this._isSystemBusy()) {
             this.logger.info("[ContextPool] Skipping rebalance after deferred close because system is busy.");
             return true;
         }
@@ -1705,7 +1725,7 @@ class BrowserManager {
             }
 
             // Check pool size limit
-            if (maxPoolSize > 0 && this.contexts.size >= maxPoolSize) {
+            if (maxPoolSize > 0 && this.contexts.size + this.initializingContexts.size >= maxPoolSize) {
                 this.logger.info(`[ContextPool] Pool size limit reached, stopping preload`);
                 break;
             }
@@ -1722,6 +1742,8 @@ class BrowserManager {
                 continue;
             }
 
+            if (this.config.accountLoadBalancing && this._isAccountUnavailable(authIndex)) continue;
+            if (this.config.accountLoadBalancing) this._poolRotation.attempted(authIndex);
             this.initializingContexts.add(authIndex);
             try {
                 this.logger.info(`[ContextPool] Background preload init context #${authIndex}...`);
@@ -1933,10 +1955,15 @@ class BrowserManager {
             this.logger.info(
                 `[ContextPool] Account #${authIndex} deprioritized for ${Math.round(ms / 1000)}s (limit/cooldown) - pool will backfill with fresh accounts.`
             );
-            const t = setTimeout(() => {
-                if (!this.isAccountDeprioritized(authIndex)) this._scheduleDeprioritizeRebuild();
+            // Recovery may fill an empty slot, never evict a healthy replacement.
+            const recoveryTimer = setTimeout(() => {
+                const cap = this.config.maxContexts;
+                if (!this.isAccountDeprioritized(authIndex) && !this._backgroundPreloadTask &&
+                    (cap === 0 || this.contexts.size + this.initializingContexts.size < cap)) {
+                    this._scheduleDeprioritizeRebuild();
+                }
             }, ms + 2000);
-            if (t.unref) t.unref();
+            recoveryTimer.unref?.();
             this._scheduleDeprioritizeRebuild();
         } catch (err) {
             this.logger.warn(`[ContextPool] deprioritizeAccount failed: ${err.message}`);
@@ -1970,6 +1997,16 @@ class BrowserManager {
      * The remaining warm contexts stay as hot standby and are NOT called.
      */
     selectActiveAuthIndices(readyIndices) {
+        if (this.config.accountLoadBalancing) {
+            const ready = new Set((readyIndices || []).filter(i => Number.isInteger(i) && i >= 0 && !this._isAccountUnavailable(i)));
+            const cap = this.config.maxContexts > 0 ? Math.max(1, Math.floor(this.config.maxContexts / 2)) : Math.max(1, Math.floor(ready.size / 2));
+            for (const i of this._poolActive) if (!ready.has(i)) this._poolActive.delete(i);
+            for (const i of [...this.contexts.keys(), ...ready]) {
+                if (this._poolActive.size >= cap) break;
+                if (ready.has(i)) this._poolActive.add(i);
+            }
+            return [...this._poolActive].slice(0, cap);
+        }
         const ready = [...new Set((readyIndices || []).filter((i) => Number.isInteger(i) && i >= 0))];
         if (ready.length <= 1) return ready;
         const activeCount = Math.max(1, Math.floor(ready.length / 2));
@@ -2029,6 +2066,45 @@ class BrowserManager {
      * Removes excess contexts and starts missing ones in background
      */
     async rebalanceContextPool() {
+        if (!this.config.accountLoadBalancing) return this._rebalanceContextPoolLegacy();
+        if (this._poolRebalanceTask) {
+            this._poolRebalanceAgain = true;
+            return this._poolRebalanceTask;
+        }
+        const task = (async () => {
+            do {
+                this._poolRebalanceAgain = false;
+                await this._rebalanceStablePool();
+            } while (this._poolRebalanceAgain);
+        })();
+        this._poolRebalanceTask = task;
+        try { return await task; }
+        finally { if (this._poolRebalanceTask === task) this._poolRebalanceTask = null; }
+    }
+
+    async _rebalanceStablePool() {
+        const rotation = this.authSource.getRotationIndices();
+        const valid = new Set(rotation);
+        const stale = [...this.contexts.keys()].filter(i =>
+            !valid.has(this.authSource.getCanonicalIndex(i) ?? i) || this.isAccountDeprioritized(i));
+        const {busy, idle} = this._prioritizeContextsForRemoval(stale);
+        for (const i of idle) await this._closeContextForPoolIfPossible(i, "stable_backfill");
+        for (const entry of busy) this._scheduleContextClosureWhenIdle(entry.authIndex, "stable_backfill");
+        const cap = this.config.maxContexts;
+        const occupancy = this.contexts.size + this.initializingContexts.size;
+        const candidates = this._poolRotation.order(rotation).filter(i =>
+            !this.contexts.has(i) && !this.initializingContexts.has(i) && !this._isAccountUnavailable(i));
+        this.logger.info(
+            "[PoolRotation] retained=[" + [...this.contexts.keys()].join(",") + "] lastAttempt=" +
+            this._poolRotation.lastAttempt + " next=[" + candidates.slice(0, 10).join(",") +
+            "] occupied=" + occupancy + " cap=" + cap
+        );
+        if (candidates.length && (cap === 0 || occupancy < cap)) {
+            await this._preloadBackgroundContexts(candidates, cap);
+        }
+    }
+
+    async _rebalanceContextPoolLegacy() {
         const maxContexts = this.config.maxContexts;
         // maxContexts === 0 means unlimited pool size
         const isUnlimited = maxContexts === 0;
@@ -2075,8 +2151,9 @@ class BrowserManager {
             currentCanonicalIndex !== this._currentAuthIndex;
 
         for (const idx of this.contexts.keys()) {
-            // Skip current account
-            if (idx === this._currentAuthIndex) continue;
+            // Keep the current account only while healthy. Once cooled down and
+            // deprioritized, it must vacate its slot for the next standby account.
+            if (idx === this._currentAuthIndex && !this.isAccountDeprioritized(idx)) continue;
 
             // If current is a duplicate AND we're in limited mode, remove the canonical version (we're using the old one)
             if (!isUnlimited && isDuplicateAccount && idx === currentCanonicalIndex) {
@@ -2149,6 +2226,19 @@ class BrowserManager {
      * @returns {Promise<{context, page}>}
      */
     async _initializeContext(authIndex, isBackgroundTask = false) {
+        try {
+            const result = await this._initializeContextWithHealth(authIndex, isBackgroundTask);
+            this.accountHealth.clear(authIndex);
+            return result;
+        } catch (error) {
+            this.accountHealth.record(authIndex, error, {
+                expired: isAuthExpiredError(error), aborted: isContextAbortedError(error)
+            });
+            throw error;
+        }
+    }
+
+    async _initializeContextWithHealth(authIndex, isBackgroundTask = false) {
         let context = null;
         let page = null;
 

@@ -33,6 +33,7 @@ class AccountLoadBalancer {
             Number.isFinite(maxCooldown) && maxCooldown > 0 ? maxCooldown : 300000;
         this.now = typeof options.now === "function" ? options.now : Date.now;
         this.logger = options.logger || null;
+        this.onCooldown = typeof options.onCooldown === "function" ? options.onCooldown : null;
         this.states = new Map();
         this.waiters = [];
         this.assignmentSequence = 0;
@@ -177,6 +178,12 @@ class AccountLoadBalancer {
             const cooldownMs = this._escalatedCooldownMs(baseCooldownMs, state.consecutiveCooldowns);
             state.cooldownUntil = Math.max(state.cooldownUntil, this.now() + cooldownMs);
             this._scheduleWakeup(cooldownMs);
+            // Lease release is the common failure path: trigger hot-pool backfill here.
+            try {
+                this.onCooldown?.(authIndex, cooldownMs, status);
+            } catch (error) {
+                this.logger?.warn?.(`[LoadBalancer] onCooldown failed: ${error.message}`);
+            }
             this.logger?.warn?.(
                 `[LoadBalancer] Account #${authIndex} cooling down for ${cooldownMs}ms after ${status}` +
                     ` (连续第 ${state.consecutiveCooldowns} 次，基础 ${baseCooldownMs}ms)`
@@ -329,6 +336,11 @@ class AccountLoadBalancer {
         if (durationMs === 0) return;
         state.cooldownUntil = Math.max(state.cooldownUntil, this.now() + durationMs);
         this._scheduleWakeup(durationMs);
+        try {
+            this.onCooldown?.(authIndex, durationMs, Number(statusOrDuration));
+        } catch (error) {
+            this.logger?.warn?.(`[LoadBalancer] onCooldown failed: ${error.message}`);
+        }
     }
 
     getSnapshot() {

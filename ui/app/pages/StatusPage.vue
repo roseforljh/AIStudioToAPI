@@ -717,6 +717,15 @@
                                 >
                                     {{ t("selectAll") }}
                                 </el-checkbox>
+                                <button
+                                    type="button"
+                                    class="btn-select-invalid"
+                                    :disabled="isBusy || state.accountDetails.length === 0"
+                                    title="只选择认证失效或文件格式错误；不选择超时、限流和中断。不会直接删除。"
+                                    @click="selectInvalidAuthAccounts"
+                                >
+                                    选择明确失效账号
+                                </button>
                                 <span v-if="hasSelection" class="selected-count">
                                     {{ t("selectedCount", { count: selectedCount }) }}
                                 </span>
@@ -865,6 +874,11 @@
                                         </span>
                                         <span v-if="item.index === state.currentAuthIndex" class="current-badge">
                                             {{ t("tagCurrent") }}
+                                        </span>
+                                        <span v-if="item.accountIssue" class="account-health-issue"
+                                            :class="{ 'is-permanent': item.accountIssue.deletable }"
+                                            :title="'auth-' + item.index + '.json · ' + item.accountIssue.code + ': ' + item.accountIssue.message">
+                                            {{ item.accountIssue.deletable ? '认证错误：' : '临时异常：' }}{{ item.accountIssue.message }}
                                         </span>
                                         <span v-if="item.isExpired" class="expired-badge">
                                             {{ t("tagExpired") }}
@@ -3898,6 +3912,13 @@ const toggleSelectAccount = index => {
 };
 
 // Toggle selection for all accounts
+const selectInvalidAuthAccounts = () => {
+    state.selectedAccounts.clear();
+    state.accountDetails.forEach(item => {
+        if (item.accountIssue?.deletable) state.selectedAccounts.add(item.index);
+    });
+};
+
 const toggleSelectAll = () => {
     if (isAllSelected.value) {
         state.selectedAccounts.clear();
@@ -5494,10 +5515,13 @@ watchEffect(() => {
     align-items: center;
     gap: 12px;
     flex-wrap: wrap;
-    height: 36px; // Force height to match buttons
+    min-height: 36px;
+    height: auto;
+    min-width: 0;
+    max-width: 100%;
 
     .el-checkbox {
-        height: 100%;
+        height: 36px;
         margin-right: 0;
         display: flex;
         align-items: center;
@@ -5510,7 +5534,7 @@ watchEffect(() => {
     font-weight: 500;
     display: flex;
     align-items: center;
-    height: 100%;
+    height: 36px;
 }
 
 .btn-batch-delete {
@@ -7361,4 +7385,46 @@ watchEffect(() => {
     height: 28px;
     border-radius: 4px;
 }
+.account-health-issue {
+    display: block;
+    max-width: 460px;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    font-size: 12px;
+    color: #b45309;
+}
+.account-health-issue.is-permanent { color: #dc2626; }
+
+/* Text action: independent of square icon buttons; never shrink into vertical text. */
+.btn-select-invalid {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: 0 0 auto;
+    width: auto;
+    min-height: 36px;
+    padding: 8px 12px;
+    box-sizing: border-box;
+    border: 1px solid @border-color;
+    border-radius: 8px;
+    background: @background-white;
+    color: @text-secondary;
+    white-space: nowrap;
+    font: inherit;
+    font-size: 13px;
+    line-height: 20px;
+    cursor: pointer;
+    transition: color 0.2s, border-color 0.2s;
+
+    &:hover:not(:disabled), &:focus-visible {
+        border-color: @primary-color;
+        color: @primary-color;
+    }
+    &:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+    }
+}
+.account-top-actions > .icon-buttons { flex: 0 0 auto; }
+
 </style>

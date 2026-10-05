@@ -1086,7 +1086,14 @@ class StatusRoutes {
 
             const hasContext = browserManager.contexts.has(index);
 
-            return { canonicalIndex, hasContext, index, isActive: activeIndexSet.has(index), isDuplicate, isExpired, isInvalid, isRotation, name };
+            const accountIssue = isInvalid
+                ? { code: "INVALID_AUTH_FILE", severity: "error", deletable: true,
+                    message: "认证文件不可读、JSON 格式错误或 cookies 结构缺失；请修复或删除文件" }
+                : isExpired
+                    ? { code: "AUTH_EXPIRED", severity: "error", deletable: true,
+                        message: "认证已失效，需要重新登录或删除文件" }
+                    : browserManager.accountHealth?.get(index) || null;
+            return { canonicalIndex, hasContext, index, isActive: activeIndexSet.has(index), isDuplicate, isExpired, isInvalid, isRotation, name, accountIssue };
         });
 
         const currentAuthIndex = requestHandler.currentAuthIndex;

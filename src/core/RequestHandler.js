@@ -1189,11 +1189,33 @@ class RequestHandler {
         return Number.isInteger(tracker?.pinnedAuthIndex) && tracker.pinnedAuthIndex >= 0;
     }
 
+    // Upstream 404s are transient in AI Studio. Retry internally before exposing
+    // the error; unlike 403/429/503, a 404 must not cool down or evict an account.
+    _shouldRetryUpstreamStatus(status) {
+        return Number(status) === 404 || Boolean(this.config?.immediateSwitchStatusCodes?.includes(Number(status)));
+    }
+
+    async _prepareTransient404Retry(errorDetails, requestId, tracker) {
+        if (Number(errorDetails?.status) !== 404 || !tracker) return false;
+        const count = Number(tracker.transient404Retries) || 0;
+        if (count >= 3) {
+            this.logger.warn(`[Retry404] Request #${requestId}: 3 internal retries exhausted; returning upstream error.`);
+            return false;
+        }
+        tracker.transient404Retries = count + 1;
+        const delayMs = [500, 1000, 2000][count];
+        this.logger.warn(`[Retry404] Request #${requestId}: internal retry ${count + 1}/3 in ${delayMs}ms on the same account.`);
+        await new Promise(resolve => setTimeout(resolve, delayMs));
+        return true;
+    }
+
     _getImmediateStatusRetryCloseReason(status) {
         return `immediate_status_retry_${status}`;
     }
 
     async _handleRequestFailure(errorDetails, sendErrorCallback = null) {
+        // A transient 404 is not an account quota/auth failure.
+        if (Number(errorDetails?.status) === 404) return;
         if (this.config.accountLoadBalancing && this.accountRequestContext.getLease()) {
             const status = Number(errorDetails?.status);
             if (this.config.immediateSwitchStatusCodes.includes(status)) {
@@ -1266,6 +1288,9 @@ class RequestHandler {
     }
 
     async _prepareImmediateStatusRetry(errorDetails, requestId, tracker, sourceAuthIndex) {
+        if (Number(errorDetails?.status) === 404) {
+            return this._prepareTransient404Retry(errorDetails, requestId, tracker);
+        }
         const currentAuthIndex = this.currentAuthIndex;
         const hasSourceAuth = Number.isInteger(sourceAuthIndex) && sourceAuthIndex >= 0;
         const hasCurrentAuth = Number.isInteger(currentAuthIndex) && currentAuthIndex >= 0;
@@ -1831,7 +1856,7 @@ class RequestHandler {
                             initialMessage.event_type === "error" &&
                             !isUserAbortedError(initialMessage) &&
                             Number.isFinite(initialStatus) &&
-                            this.config?.immediateSwitchStatusCodes?.includes(initialStatus)
+                            this._shouldRetryUpstreamStatus(initialStatus)
                         ) {
                             this.logger.warn(
                                 `[Request] OpenAI real stream received ${initialStatus}, preparing retry...`
@@ -2234,7 +2259,7 @@ class RequestHandler {
                             initialMessage.event_type === "error" &&
                             !isUserAbortedError(initialMessage) &&
                             Number.isFinite(initialStatus) &&
-                            this.config?.immediateSwitchStatusCodes?.includes(initialStatus)
+                            this._shouldRetryUpstreamStatus(initialStatus)
                         ) {
                             this.logger.warn(
                                 `[Request] OpenAI Response API real stream received ${initialStatus}, preparing retry...`
@@ -2606,7 +2631,7 @@ class RequestHandler {
                             initialMessage.event_type === "error" &&
                             !isUserAbortedError(initialMessage) &&
                             Number.isFinite(initialStatus) &&
-                            this.config?.immediateSwitchStatusCodes?.includes(initialStatus)
+                            this._shouldRetryUpstreamStatus(initialStatus)
                         ) {
                             this.logger.warn(
                                 `[Request] Claude real stream received ${initialStatus}, preparing retry...`
@@ -3555,7 +3580,7 @@ class RequestHandler {
                 proxyRequest.is_generative &&
                 !isUserAbortedError(headerMessage) &&
                 Number.isFinite(headerStatus) &&
-                this.config?.immediateSwitchStatusCodes?.includes(headerStatus)
+                this._shouldRetryUpstreamStatus(headerStatus)
             ) {
                 this.logger.warn(`[Request] Gemini real stream received ${headerStatus}, preparing retry...`);
                 this._cancelCurrentAttemptBeforeRetry(proxyRequest, currentQueueAuthIndex);
@@ -3988,6 +4013,21 @@ class RequestHandler {
                 this._cancelCurrentAttemptBeforeRetry(proxyRequest, currentQueueAuthIndex);
 
                 const errorStatus = Number(errorPayload?.status);
+                // Retry before sending any response. Keep the same file-owner/account,
+                // but use a new attempt ID/queue so late messages cannot contaminate retries.
+                if (errorStatus === 404 && proxyRequest.is_generative && !isUserAbortedError(errorPayload)) {
+                    const prepared = await this._prepareTransient404Retry(errorPayload, proxyRequest.request_id, immediateSwitchTracker);
+                    if (!prepared || (totalDeadline !== null && Date.now() >= totalDeadline)) {
+                        lastError = { ...errorPayload, skipAccountSwitch: true };
+                        break;
+                    }
+                    try { currentQueue.close("transient_404_retry"); } catch { /* already closed */ }
+                    this._advanceProxyRequestAttempt(proxyRequest);
+                    currentQueue = this.connectionRegistry.createMessageQueue(
+                        proxyRequest.request_id, currentQueueAuthIndex, proxyRequest.request_attempt_id
+                    );
+                    continue;
+                }
                 const isStallTimeoutStatus = errorStatus === 504;
                 if (
                     this.config.accountLoadBalancing &&

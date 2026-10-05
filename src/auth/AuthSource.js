@@ -130,6 +130,11 @@ class AuthSource {
             if (authContent) {
                 try {
                     const authData = JSON.parse(authContent);
+                    if (!authData || !Array.isArray(authData.cookies) || authData.cookies.length === 0 ||
+                        authData.cookies.some(c => !c || typeof c.name !== "string" || typeof c.value !== "string") ||
+                        (authData.origins !== undefined && !Array.isArray(authData.origins))) {
+                        throw new Error("Invalid storageState structure");
+                    }
                     validIndices.push(index);
                     this.accountNameMap.set(index, authData.accountName || null);
                     // Track expired status from auth file
