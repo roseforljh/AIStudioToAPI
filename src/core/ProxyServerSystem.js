@@ -24,6 +24,7 @@ const UsageStatsService = require("./UsageStatsService");
 const ConfigLoader = require("../utils/ConfigLoader");
 const RuntimeSettingsStore = require("../utils/RuntimeSettingsStore");
 const WebRoutes = require("../routes/WebRoutes");
+const ContextReclaimer = require("./ContextReclaimer");
 
 /**
  * Proxy Server System
@@ -110,6 +111,13 @@ class ProxyServerSystem extends EventEmitter {
             this.authSource
         );
         this.browserManager.setSystemBusyProvider(() => this.requestHandler?.isSystemBusy === true);
+        this.browserManager.contextMaintenance = this.requestHandler.accountLoadBalancer;
+        this.contextReclaimer = new ContextReclaimer({
+            browserManager: this.browserManager,
+            config: this.config,
+            getActiveRequestCount: () => this.requestHandler.accountLoadBalancer.getActiveRequestCount(),
+            logger: this.logger,
+        });
 
         this.httpServer = null;
         this.wsServer = null;
@@ -194,6 +202,7 @@ class ProxyServerSystem extends EventEmitter {
             this.requestHandler.authSwitcher.isSystemBusy = false;
         }
 
+        this.contextReclaimer.start();
         this.emit("started");
     }
 
@@ -676,6 +685,7 @@ class ProxyServerSystem extends EventEmitter {
      */
     async shutdown() {
         this.logger.info("[System] Shutting down server system...");
+        this.contextReclaimer?.stop();
 
         // Clear stale queue cleanup interval
         if (this.staleQueueCleanupInterval) {

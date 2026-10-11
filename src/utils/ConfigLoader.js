@@ -28,6 +28,10 @@ class ConfigLoader {
             apiKeySource: "Not set",
             browserExecutablePath: null,
             checkUpdate: true,
+            contextReclaimerEnabled: false,
+            contextReclaimerIdleMs: 3600000,
+            contextReclaimerIntervalMs: 60000,
+            contextReclaimerMemoryMb: 6144,
             enableAuthUpdate: true,
             enableUsageStats: true,
             failureThreshold: 3,
@@ -57,6 +61,18 @@ class ConfigLoader {
         if (process.env.HOST) config.host = process.env.HOST;
         if (process.env.ACCOUNT_LOAD_BALANCING)
             config.accountLoadBalancing = process.env.ACCOUNT_LOAD_BALANCING.toLowerCase() === "true";
+        if (process.env.CONTEXT_RECLAIMER_ENABLED)
+            config.contextReclaimerEnabled = process.env.CONTEXT_RECLAIMER_ENABLED.toLowerCase() === "true";
+        for (const [envName, key] of [
+            ["CONTEXT_RECLAIMER_IDLE_MS", "contextReclaimerIdleMs"],
+            ["CONTEXT_RECLAIMER_INTERVAL_MS", "contextReclaimerIntervalMs"],
+            ["CONTEXT_RECLAIMER_MEMORY_MB", "contextReclaimerMemoryMb"],
+        ]) {
+            if (process.env[envName]) {
+                const parsed = parseInt(process.env[envName], 10);
+                if (Number.isFinite(parsed) && parsed > 0) config[key] = parsed;
+            }
+        }
         if (process.env.ACCOUNT_MAX_CONCURRENT_REQUESTS) {
             const parsed = parseInt(process.env.ACCOUNT_MAX_CONCURRENT_REQUESTS, 10);
             config.accountMaxConcurrentRequests = Number.isFinite(parsed)

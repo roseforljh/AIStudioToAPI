@@ -14,7 +14,12 @@ class AccountLoadBalancer {
             throw new TypeError("getEligibleAuthIndices must be a function");
         }
 
-        this.getEligibleAuthIndices = options.getEligibleAuthIndices;
+        this.maintenanceIndices = new Set();
+        // Central gate also covers preferred-account and cooldown fallback selection.
+        this.getEligibleAuthIndices = () =>
+            options.getEligibleAuthIndices().filter(index => !this.maintenanceIndices.has(index));
+        this.onRequestFinished = options.onRequestFinished;
+
         this.maxConcurrentRequests = options.maxConcurrentRequests ?? null;
         this.maxConcurrentPerAccount = Math.max(1, Number(options.maxConcurrentPerAccount) || 1);
         this.acquireTimeoutMs = Math.max(1, Number(options.acquireTimeoutMs) || 30000);
@@ -29,8 +34,7 @@ class AccountLoadBalancer {
         const escalation = Number(options.cooldownEscalation);
         this.cooldownEscalation = Number.isFinite(escalation) && escalation > 1 ? escalation : 2;
         const maxCooldown = Number(options.maxCooldownMs);
-        this.maxCooldownMs =
-            Number.isFinite(maxCooldown) && maxCooldown > 0 ? maxCooldown : 300000;
+        this.maxCooldownMs = Number.isFinite(maxCooldown) && maxCooldown > 0 ? maxCooldown : 300000;
         this.now = typeof options.now === "function" ? options.now : Date.now;
         this.logger = options.logger || null;
         this.onCooldown = typeof options.onCooldown === "function" ? options.onCooldown : null;
@@ -154,6 +158,21 @@ class AccountLoadBalancer {
         return active;
     }
 
+    beginMaintenance(authIndex) {
+        if (this.maintenanceIndices.has(authIndex) || this._getState(authIndex).activeRequests > 0) return false;
+        this.maintenanceIndices.add(authIndex);
+        return true;
+    }
+
+    endMaintenance(authIndex) {
+        this.maintenanceIndices.delete(authIndex);
+        this.notifyAvailabilityChanged();
+    }
+
+    getActiveRequestCount() {
+        return this._getActiveRequestCount();
+    }
+
     _reserve(authIndex) {
         const state = this._getState(authIndex);
         state.activeRequests++;
@@ -171,6 +190,7 @@ class AccountLoadBalancer {
     _release(authIndex, options = {}) {
         const state = this._getState(authIndex);
         state.activeRequests = Math.max(0, state.activeRequests - 1);
+        this.onRequestFinished?.(authIndex);
         const status = Number(options.status);
         const baseCooldownMs = this.cooldownByStatus.get(status) || 0;
         if (baseCooldownMs > 0) {
@@ -260,8 +280,8 @@ class AccountLoadBalancer {
                 abortHandler: null,
                 exclude,
                 preferredAuthIndex,
-                requirePreferred,
                 reject,
+                requirePreferred,
                 resolve,
                 signal,
                 timeoutId: null,

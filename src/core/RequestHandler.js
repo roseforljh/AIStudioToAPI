@@ -49,6 +49,7 @@ class RequestHandler {
             // 403 基础冷却 30s（连续 403 会自动升档到 300s 上限）：上游 403 常常只针对某一类
             // 请求/某一时刻，若直接用 300s 会把整池按死，导致连纯文本请求都拿 503。
             cooldownByStatus: { 403: 30000, 429: 60000, 503: 30000 },
+
             getEligibleAuthIndices: () => {
                 if (!config.accountLoadBalancing) return [this.authSwitcher.currentAuthIndex];
                 const ready = [...this.connectionRegistry.getAllConnections().entries()]
@@ -64,17 +65,18 @@ class RequestHandler {
             },
             logger,
             maxConcurrentPerAccount: config.accountMaxConcurrentRequests,
-            maxConcurrentRequests: (eligibleCount) => {
+            maxConcurrentRequests: eligibleCount => {
                 const active = Math.max(1, Number(eligibleCount) || 1);
                 const cfg = Number(config.accountMaxConcurrentRequestsTotal);
                 return Number.isFinite(cfg) && cfg > 0 ? Math.min(active, cfg) : active;
             },
+            onRequestFinished: index => this.browserManager.touchContext?.(index),
         });
         // PATCH(active/standby split): let the pool know which accounts are temporarily
         // unusable (cooling down) so the ACTIVE window can slide onto standby accounts.
         try {
             if (this.browserManager && typeof this.browserManager.setAccountAvailabilityChecker === "function") {
-                this.browserManager.setAccountAvailabilityChecker((idx) => {
+                this.browserManager.setAccountAvailabilityChecker(idx => {
                     try {
                         return this.accountLoadBalancer.isCoolingDown(idx);
                     } catch (e) {
@@ -98,13 +100,13 @@ class RequestHandler {
         });
         this.uploadedFileStore = new UploadedFileStore({
             dir: path.join(process.cwd(), "data", "files-cache"),
+            logger: this.logger,
             maxTotalBytes: Number(process.env.FILES_CACHE_MAX_BYTES) || undefined,
             ttlMs: Number(process.env.FILES_CACHE_TTL_MS) || undefined,
-            logger: this.logger,
         });
         this.fileReferenceInliner = new FileReferenceInliner({
-            maxInlineBytes: Number(process.env.FILES_INLINE_MAX_BYTES) || undefined,
             logger: this.logger,
+            maxInlineBytes: Number(process.env.FILES_INLINE_MAX_BYTES) || undefined,
         });
 
         this.needsSwitchingAfterRequest = false;
@@ -333,14 +335,8 @@ class RequestHandler {
         const initial = Number(config.initialResponseTimeoutMs);
         const total = Number(config.totalRequestTimeoutMs);
         return {
-            initial:
-                Number.isFinite(initial) && initial > 0
-                    ? initial
-                    : LOAD_BALANCER_INITIAL_RESPONSE_TIMEOUT_MS,
-            total:
-                Number.isFinite(total) && total > 0
-                    ? total
-                    : LOAD_BALANCER_TOTAL_REQUEST_TIMEOUT_MS,
+            initial: Number.isFinite(initial) && initial > 0 ? initial : LOAD_BALANCER_INITIAL_RESPONSE_TIMEOUT_MS,
+            total: Number.isFinite(total) && total > 0 ? total : LOAD_BALANCER_TOTAL_REQUEST_TIMEOUT_MS,
         };
     }
 
@@ -361,7 +357,7 @@ class RequestHandler {
             // PATCH(file-owner-affinity): 文件管理路由（GET/DELETE/PATCH /v1beta/files/{id}）必须回到
             // 文件所属账号——换账号访问同一文件时上游直接 500 INTERNAL（实测：JMJ 轮询文件状态即失败）。
             // 这一条不受「本地已缓存」豁免影响：缓存只在生成请求里能替代 fileUri，救不了文件管理路由。
-            if (pathFileId) return affinity.resolvePinnedAuthIndex({ uploadSessionId, fileIds });
+            if (pathFileId) return affinity.resolvePinnedAuthIndex({ fileIds, uploadSessionId });
             // PATCH(file-inline): 能被本地缓存内联的文件不需要粘在所属账号上——
             // 粘性会阻止 403 换号，而部分账号对媒体请求会返回 403（实测）。
             const inlineCapBytes = this._inlineSizeCapBytes();
@@ -376,7 +372,7 @@ class RequestHandler {
                     return Boolean(entry) && Number(entry.size) <= inlineCapBytes;
                 });
             if (allFilesInlinable) return null;
-            return affinity.resolvePinnedAuthIndex({ uploadSessionId, fileIds });
+            return affinity.resolvePinnedAuthIndex({ fileIds, uploadSessionId });
         } catch (error) {
             this.logger.warn(`[Affinity] Failed to resolve affinity pin: ${error.message}`);
             return null;
@@ -387,10 +383,10 @@ class RequestHandler {
         if (!req) return null;
         const rawUrl = req.originalUrl || req.url || "";
         return this._extractAffinityPin({
+            bodyBuffer: Buffer.isBuffer(req.rawBody) ? req.rawBody : null,
             queryParams: req.query || null,
             rawUrl,
             requestPath: (req.path || rawUrl || "").split("?")[0],
-            bodyBuffer: Buffer.isBuffer(req.rawBody) ? req.rawBody : null,
         });
     }
 
@@ -404,15 +400,15 @@ class RequestHandler {
         }
         const rawPath = proxyRequest.path || "";
         return this._extractAffinityPin({
+            bodyBuffer,
             queryParams: proxyRequest.query_params || null,
             rawUrl: rawPath,
             requestPath: rawPath.split("?")[0],
-            bodyBuffer,
         });
     }
 
     /** 记录「上传会话 / 文件 -> 账号」，供同一会话的后续请求与引用该文件的生成请求使用 */
-    _recordAffinityFromResponse({ proxyRequest, req = null, res, bodyBuffer }) {
+    _recordAffinityFromResponse({ proxyRequest, res, bodyBuffer }) {
         const affinity = this.uploadSessionAffinity;
         if (!affinity || !this.config.accountLoadBalancing) return;
         const authIndex = this.currentAuthIndex;
@@ -439,7 +435,6 @@ class RequestHandler {
                         `(${proxyRequest.method} ${proxyRequest.path}).`
                 );
             }
-
         } catch (error) {
             this.logger.warn(`[Affinity] Failed to record affinity binding: ${error.message}`);
         }
@@ -544,11 +539,7 @@ class RequestHandler {
         }
         if (!bodyField) {
             const requestPath = String(proxyRequest.path || "");
-            if (
-                /generateContent/i.test(requestPath) &&
-                !plainBody &&
-                !proxyRequest.body_b64
-            ) {
+            if (/generateContent/i.test(requestPath) && !plainBody && !proxyRequest.body_b64) {
                 this.logger.warn("[FileInline] 生成请求缺少可解析的请求体字段，文件引用可能未被内联。");
             }
             return { ok: true };
@@ -585,8 +576,8 @@ class RequestHandler {
                 const ownerPin =
                     this.config.fileOversizeReference === true && this.uploadSessionAffinity
                         ? this.uploadSessionAffinity.resolvePinnedAuthIndex({
-                              uploadSessionId: null,
                               fileIds: references.map(item => item.fileId),
+                              uploadSessionId: null,
                           })
                         : null;
                 if (ownerPin && ownerPin.authIndex === this.currentAuthIndex) {
@@ -597,15 +588,15 @@ class RequestHandler {
                     return { ok: true, oversized: true, skipped: true };
                 }
                 return {
-                    ok: false,
                     error: {
+                        fileIds: references.map(item => item.fileId),
                         message:
                             `文件过大：该反向代理无法用 Files API 引用（上游会 403），只能内联传输，` +
                             `上限 ${limitMiB} MB，当前请求合计 ${(totalBytes / 1048576).toFixed(1)} MB。请压缩或截短视频后重试。`,
-                        status: 413,
                         skipAccountSwitch: true,
-                        fileIds: references.map(item => item.fileId),
+                        status: 413,
                     },
+                    ok: false,
                 };
             }
         }
@@ -615,7 +606,7 @@ class RequestHandler {
             if (!entry) return null;
             const buffer = store.readBuffer(fileId);
             if (!buffer) return null;
-            return { data: buffer.toString("base64"), mimeType: entry.mimeType, bytes: buffer.length };
+            return { bytes: buffer.length, data: buffer.toString("base64"), mimeType: entry.mimeType };
         });
 
         if (!stats.replaced) {
@@ -647,7 +638,10 @@ class RequestHandler {
             `[FileInline] 已把 ${stats.replaced} 个文件引用内联为 base64（${(stats.bytes / 1048576).toFixed(2)} MB，账号 #${this.currentAuthIndex}）。`
         );
         if (process.env.FILE_INLINE_DEBUG === "1") {
-            const skeleton = JSON.stringify(body).replace(/"data":"[^"]*"/g, match => `"data":"<${match.length} chars>"`);
+            const skeleton = JSON.stringify(body).replace(
+                /"data":"[^"]*"/g,
+                match => `"data":"<${match.length} chars>"`
+            );
             this.logger.info(`[FileInline][DEBUG] 改写后请求体(前400字符)=${skeleton.slice(0, 400)}`);
         }
         return { ok: true, stats };
@@ -671,12 +665,13 @@ class RequestHandler {
                 this._loadBalancerTimeouts().total
             );
             lease = await this.accountLoadBalancer.acquire({
-                signal: controller.signal,
-                timeoutMs: acquireTimeoutMs,
                 preferredAuthIndex: affinityPin ? affinityPin.authIndex : null,
                 requirePreferred: Boolean(affinityPin),
+                signal: controller.signal,
+                timeoutMs: acquireTimeoutMs,
             });
             const assignedAuthIndex = lease.authIndex;
+            this.browserManager.touchContext?.(assignedAuthIndex);
             if (
                 !this.browserManager.contexts.has(assignedAuthIndex) ||
                 this.connectionRegistry.getConnectionByAuth(assignedAuthIndex, false)?.readyState !== 1
@@ -693,9 +688,7 @@ class RequestHandler {
             }
             this.logger.info(
                 `[LoadBalancer] Assigned request ${req.method} ${req.path} to account #${lease.authIndex}` +
-                    (affinityPin
-                        ? ` (affinity: ${affinityPin.source} -> account #${affinityPin.authIndex})`
-                        : "")
+                    (affinityPin ? ` (affinity: ${affinityPin.source} -> account #${affinityPin.authIndex})` : "")
             );
             return await this.accountRequestContext.run({ lease }, callback);
         } catch (error) {
@@ -1173,11 +1166,8 @@ class RequestHandler {
         }
         const pinnedFromOption = Number.isInteger(options.pinnedAuthIndex) ? options.pinnedAuthIndex : null;
         const pinnedFromLease = this.accountRequestContext.getLease?.()?.pinnedAuthIndex;
-        const pinnedAuthIndex = pinnedFromOption !== null
-            ? pinnedFromOption
-            : Number.isInteger(pinnedFromLease)
-              ? pinnedFromLease
-              : null;
+        const pinnedAuthIndex =
+            pinnedFromOption !== null ? pinnedFromOption : Number.isInteger(pinnedFromLease) ? pinnedFromLease : null;
         return { attemptedAuthIndices, pinnedAuthIndex };
     }
 
@@ -1199,12 +1189,16 @@ class RequestHandler {
         if (Number(errorDetails?.status) !== 404 || !tracker) return false;
         const count = Number(tracker.transient404Retries) || 0;
         if (count >= 3) {
-            this.logger.warn(`[Retry404] Request #${requestId}: 3 internal retries exhausted; returning upstream error.`);
+            this.logger.warn(
+                `[Retry404] Request #${requestId}: 3 internal retries exhausted; returning upstream error.`
+            );
             return false;
         }
         tracker.transient404Retries = count + 1;
         const delayMs = [500, 1000, 2000][count];
-        this.logger.warn(`[Retry404] Request #${requestId}: internal retry ${count + 1}/3 in ${delayMs}ms on the same account.`);
+        this.logger.warn(
+            `[Retry404] Request #${requestId}: internal retry ${count + 1}/3 in ${delayMs}ms on the same account.`
+        );
         await new Promise(resolve => setTimeout(resolve, delayMs));
         return true;
     }
@@ -3805,9 +3799,9 @@ class RequestHandler {
             this._setResponseHeaders(res, headerMessage, req);
 
             // PATCH(upload-affinity): 记录上传会话/文件与账号的绑定，供后续请求回到同一账号。
-            this._recordAffinityFromResponse({ proxyRequest, req, res, bodyBuffer: fullBodyBuffer });
+            this._recordAffinityFromResponse({ bodyBuffer: fullBodyBuffer, proxyRequest, req, res });
             // PATCH(file-inline): 维护上传文件字节缓存。
-            this._recordUploadedFileCache({ proxyRequest, req, bodyBuffer: fullBodyBuffer });
+            this._recordUploadedFileCache({ bodyBuffer: fullBodyBuffer, proxyRequest, req });
 
             // Ensure Content-Type is set (Express defaults Buffer to application/octet-stream)
             if (!res.get("Content-Type")) {
@@ -3864,14 +3858,12 @@ class RequestHandler {
         // PATCH(file-inline): 把请求体里对已上传文件的引用换成内联 base64（上游对 Files API 引用会 403）。
         const inlineResult = this._applyFileReferenceInlining(proxyRequest);
         if (!inlineResult.ok) {
-            return { success: false, error: inlineResult.error, queue: messageQueue, message: null };
+            return { error: inlineResult.error, message: null, queue: messageQueue, success: false };
         }
 
         let lastError = null;
         let currentQueue = messageQueue;
-        const totalDeadline = this.config.accountLoadBalancing
-            ? Date.now() + this._loadBalancerTimeouts().total
-            : null;
+        const totalDeadline = this.config.accountLoadBalancing ? Date.now() + this._loadBalancerTimeouts().total : null;
         const registeredQueueAuthIndex = this.connectionRegistry.getAuthIndexForRequest(proxyRequest.request_id);
         // Track the authIndex registered for the current queue, which may differ from the global current account.
         let currentQueueAuthIndex =
@@ -4016,15 +4008,25 @@ class RequestHandler {
                 // Retry before sending any response. Keep the same file-owner/account,
                 // but use a new attempt ID/queue so late messages cannot contaminate retries.
                 if (errorStatus === 404 && proxyRequest.is_generative && !isUserAbortedError(errorPayload)) {
-                    const prepared = await this._prepareTransient404Retry(errorPayload, proxyRequest.request_id, immediateSwitchTracker);
+                    const prepared = await this._prepareTransient404Retry(
+                        errorPayload,
+                        proxyRequest.request_id,
+                        immediateSwitchTracker
+                    );
                     if (!prepared || (totalDeadline !== null && Date.now() >= totalDeadline)) {
                         lastError = { ...errorPayload, skipAccountSwitch: true };
                         break;
                     }
-                    try { currentQueue.close("transient_404_retry"); } catch { /* already closed */ }
+                    try {
+                        currentQueue.close("transient_404_retry");
+                    } catch {
+                        /* already closed */
+                    }
                     this._advanceProxyRequestAttempt(proxyRequest);
                     currentQueue = this.connectionRegistry.createMessageQueue(
-                        proxyRequest.request_id, currentQueueAuthIndex, proxyRequest.request_attempt_id
+                        proxyRequest.request_id,
+                        currentQueueAuthIndex,
+                        proxyRequest.request_attempt_id
                     );
                     continue;
                 }
