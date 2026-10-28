@@ -1,3 +1,4 @@
+const { MakerSuiteBridge } = require("./MakerSuiteBridge");
 /**
  * File: src/core/BrowserManager.js
  * Description: Browser manager for launching and controlling headless Firefox instances with authentication contexts
@@ -100,7 +101,7 @@ class BrowserManager {
         this._wsInitState = new Map();
 
         // Target URL for AI Studio app
-        this.targetUrl = "https://ai.studio/apps/cab9ab6c-44f9-4e7a-8972-037f8ae177ab";
+        this.targetUrl = process.env.AI_STUDIO_APP_URL || "https://ai.studio/apps/56128c84-c8e6-4d52-bf94-934c836720d9";
 
         // Firefox/Camoufox does not use Chromium-style command line args.
         // We keep this empty; Camoufox has its own anti-fingerprinting optimizations built-in.
@@ -2393,6 +2394,8 @@ class BrowserManager {
             await context.addInitScript(privacyScript);
 
             page = await context.newPage();
+            page.makerSuiteBridge = new MakerSuiteBridge({ page, context, logger: this.logger, authIndex });
+            await page.makerSuiteBridge.install();
 
             // Pure JS Wakeup (Focus & Mouse Movement)
             // Skip focus operations for background tasks to avoid window focus conflicts
