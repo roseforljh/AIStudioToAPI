@@ -36,10 +36,35 @@ class AccountRoutingPolicy {
         const normal=ordered.filter(i=>this.group(i)==='normal').slice(0,this.settings.normalActive);
         return [...paid,...normal];
     }
-    isPaidOnly(model) { return /^gemini-4-argon$/i.test(cleanModel(String(model || ''))); }
+    evidence(index, model) {
+        model = cleanModel(String(model || ''));
+        const entry = this.modelEvidence[model]?.[index];
+        return entry && entry.fingerprint === this.scanner.fingerprint(index) ? entry : null;
+    }
+    blocked(index, model) { const entry = this.evidence(index, model); return !!entry && entry.until > Date.now(); }
+    rank(index, model) {
+        const entry = this.evidence(index, model);
+        const recentSuccess = entry?.successAt && Date.now() - entry.successAt < 7 * 86400000;
+        return recentSuccess ? 0 : (this.group(index) === 'normal' ? 10 : 20);
+    }
+    noteSuccess(index, model) {
+        model = cleanModel(String(model || '')); const fingerprint = this.scanner.fingerprint(index);
+        if (!model || !fingerprint) return;
+        this.modelEvidence[model] ||= {};
+        const old = this.evidence(index, model) || {};
+        this.modelEvidence[model][index] = { fingerprint, until: 0, successAt: Date.now(), successes: Math.min(100000, (old.successes || 0) + 1) };
+        this.persist();
+    }
     noteDenied(index, model) { this.markUnsupported(index, model, 600000); }
-    blocked(index,model) { model=cleanModel(String(model||'')); const x=this.modelEvidence[model]?.[index];return !!x && x.until>Date.now() && x.fingerprint===this.scanner.fingerprint(index); }
-    markUnsupported(index,model, durationMs=86400000) { model=cleanModel(String(model||'')); if (!model) return; const fingerprint=this.scanner.fingerprint(index);if(!fingerprint)return;this.modelEvidence[model] ||= {};this.modelEvidence[model][index]={until:Date.now()+durationMs,fingerprint};this.persist(); }
-    clear(index,model) { model=cleanModel(String(model||'')); if (this.modelEvidence[model]?.[index]) {delete this.modelEvidence[model][index];this.persist();} }
+    markUnsupported(index, model, durationMs = 86400000) {
+        model = cleanModel(String(model || '')); if (!model) return;
+        const fingerprint = this.scanner.fingerprint(index); if (!fingerprint) return;
+        this.modelEvidence[model] ||= {};
+        const old = this.evidence(index, model) || {};
+        this.modelEvidence[model][index] = { ...old, fingerprint, until: Date.now() + durationMs, lastDeniedAt: Date.now() };
+        this.persist();
+    }
+    clear(index, model) { this.noteSuccess(index, model); }
+
 }
 module.exports=AccountRoutingPolicy;

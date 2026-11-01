@@ -100,6 +100,10 @@ class AccountLoadBalancer {
         }
 
         eligible.sort((a, b) => {
+            if (typeof options.rank === "function") {
+                const difference = options.rank(a.authIndex) - options.rank(b.authIndex);
+                if (difference) return difference;
+            }
             if (a.state.activeRequests !== b.state.activeRequests) {
                 return a.state.activeRequests - b.state.activeRequests;
             }
@@ -215,7 +219,7 @@ class AccountLoadBalancer {
         this._drainWaiters();
     }
 
-    _createLease(authIndex, allowed = null, noCoolingFallback = false) {
+    _createLease(authIndex, allowed = null, noCoolingFallback = false, rank = null) {
         const balancer = this;
         let released = false;
         let currentAuthIndex = authIndex;
@@ -235,7 +239,7 @@ class AccountLoadBalancer {
                 const previousCooldownUntil = previousState.cooldownUntil;
                 balancer._release(previousAuthIndex, releaseOptions);
                 try {
-                    const replacement = await balancer.acquire({ ...options, allowed: options.allowed || allowed, noCoolingFallback: options.noCoolingFallback ?? noCoolingFallback });
+                    const replacement = await balancer.acquire({ ...options, allowed: options.allowed || allowed, noCoolingFallback: options.noCoolingFallback ?? noCoolingFallback, rank: options.rank || rank });
                     currentAuthIndex = replacement.authIndex;
                     replacement._transfer();
                     return currentAuthIndex;
@@ -265,11 +269,11 @@ class AccountLoadBalancer {
         const globalLimit = this._getGlobalConcurrencyLimit();
         const authIndex =
             globalLimit > 0 && this._getActiveRequestCount() < globalLimit
-                ? this._selectAuthIndex(exclude, preferredAuthIndex, { requirePreferred, allowed, noCoolingFallback: options.noCoolingFallback })
+                ? this._selectAuthIndex(exclude, preferredAuthIndex, { requirePreferred, allowed, noCoolingFallback: options.noCoolingFallback, rank: options.rank })
                 : null;
         if (authIndex !== null) {
             this._reserve(authIndex);
-            return Promise.resolve(this._createLease(authIndex, allowed, options.noCoolingFallback));
+            return Promise.resolve(this._createLease(authIndex, allowed, options.noCoolingFallback, options.rank));
         }
 
         const signal = options.signal;
@@ -282,6 +286,7 @@ class AccountLoadBalancer {
                 abortHandler: null,
                 allowed,
                 noCoolingFallback: options.noCoolingFallback,
+                rank: options.rank,
                 exclude,
                 preferredAuthIndex,
                 reject,
@@ -334,12 +339,13 @@ class AccountLoadBalancer {
                 requirePreferred: waiter.requirePreferred === true,
                 allowed: waiter.allowed,
                 noCoolingFallback: waiter.noCoolingFallback,
+                rank: waiter.rank,
             });
             if (authIndex === null) continue;
             this._removeWaiter(waiter);
             waiter.cleanup();
             this._reserve(authIndex);
-            waiter.resolve(this._createLease(authIndex, waiter.allowed, waiter.noCoolingFallback));
+            waiter.resolve(this._createLease(authIndex, waiter.allowed, waiter.noCoolingFallback, waiter.rank));
         }
     }
 

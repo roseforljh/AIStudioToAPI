@@ -656,7 +656,7 @@ class RequestHandler {
         const policy = this.serverSystem.accountRoutingPolicy;
         const ready = [...this.connectionRegistry.getAllConnections().entries()].filter(([, c]) => c?.readyState === 1).map(([i]) => i).filter(i => this.browserManager.contexts.has(i));
         const active = this.browserManager.selectActiveAuthIndices(ready);
-        const allowed = model && policy ? new Set(active.filter(i => !policy.blocked(i, model) && (!policy.isPaidOnly(model) || policy.group(i) === "paid"))) : null;
+        const allowed = model && policy ? new Set(active.filter(i => !policy.blocked(i, model))) : null;
         if (allowed && !allowed.size) {
             this._sendErrorResponse(res, 503, `No eligible active account is available for model ${model}; check account permissions or pool settings.`);
             return;
@@ -676,6 +676,7 @@ class RequestHandler {
             lease = await this.accountLoadBalancer.acquire({
                 allowed,
                 noCoolingFallback: Boolean(model),
+                rank: model && policy ? index => policy.rank(index, model) : null,
                 preferredAuthIndex: affinityPin ? affinityPin.authIndex : null,
                 requirePreferred: Boolean(affinityPin),
                 signal: controller.signal,
@@ -702,7 +703,9 @@ class RequestHandler {
                     (affinityPin ? ` (affinity: ${affinityPin.source} -> account #${affinityPin.authIndex})` : "")
             );
             const recordResult = () => {
-                if (model && policy && res.statusCode >= 200 && res.statusCode < 300) policy.clear(lease.authIndex, model);
+                if (model && policy && res.statusCode >= 200 && res.statusCode < 300 && !res.__usageTrackingClientAborted && res.__usageTrackingOutcome !== "error" && !res.__usageTrackingErrorStatus) {
+                    try { policy.noteSuccess(lease.authIndex, model); } catch (e) { this.logger.warn(`[Routing] Could not save success evidence: ${e.name}`); }
+                }
             };
             res.once("finish", recordResult);
             return await this.accountRequestContext.run({ lease, model }, callback);
@@ -1176,8 +1179,8 @@ class RequestHandler {
     _getRequestAttemptLimit() {
         const configured = Math.max(1, Number(this.config?.maxRetries) || 1);
         if (!this.config?.accountLoadBalancing) return configured;
-        const eligibleAccounts = this.accountLoadBalancer?.getSnapshot?.()?.accounts?.length || 0;
-        return Math.max(configured, eligibleAccounts);
+        const eligibleAccounts = this.accountLoadBalancer?.getEligibleAuthIndices?.().length ?? this.accountLoadBalancer?.getSnapshot?.()?.accounts?.length ?? 0;
+        return Math.min(30, Math.max(configured, eligibleAccounts));
     }
 
     _createImmediateSwitchTracker(initialAuthIndex = this.currentAuthIndex, options = {}) {
@@ -4043,7 +4046,7 @@ class RequestHandler {
                     if (this._isPinnedRequest(immediateSwitchTracker) || !this.config.accountLoadBalancing || !this.accountRequestContext.getLease()) {
                         lastError = { ...errorPayload, skipAccountSwitch: true }; break;
                     }
-                    if (retryAttempt >= this.config.maxRetries) { lastError = { ...errorPayload, skipAccountSwitch: true }; break; }
+                    if (retryAttempt >= requestAttemptLimit) { lastError = { ...errorPayload, skipAccountSwitch: true }; break; }
                     try {
                         const moved = await this._moveCurrentAccountLease(errorPayload, immediateSwitchTracker.attemptedAuthIndices);
                         const nextIndex = this.accountRequestContext.getLease()?.authIndex;
