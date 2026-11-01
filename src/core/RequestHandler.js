@@ -652,6 +652,15 @@ class RequestHandler {
             return callback();
         }
 
+        const model = this._extractModelFromPath(req.path || "") || (typeof req.body?.model === "string" ? req.body.model.replace(/^models\//, "") : null);
+        const policy = this.serverSystem.accountRoutingPolicy;
+        const ready = [...this.connectionRegistry.getAllConnections().entries()].filter(([, c]) => c?.readyState === 1).map(([i]) => i).filter(i => this.browserManager.contexts.has(i));
+        const active = this.browserManager.selectActiveAuthIndices(ready);
+        const allowed = model && policy ? new Set(active.filter(i => !policy.blocked(i, model) && (!policy.isPaidOnly(model) || policy.group(i) === "paid"))) : null;
+        if (allowed && !allowed.size) {
+            this._sendErrorResponse(res, 503, `No eligible active account is available for model ${model}; check account permissions or pool settings.`);
+            return;
+        }
         const affinityPin = this._getRequestAffinityPin(req);
 
         const controller = new AbortController();
@@ -665,6 +674,8 @@ class RequestHandler {
                 this._loadBalancerTimeouts().total
             );
             lease = await this.accountLoadBalancer.acquire({
+                allowed,
+                noCoolingFallback: Boolean(model),
                 preferredAuthIndex: affinityPin ? affinityPin.authIndex : null,
                 requirePreferred: Boolean(affinityPin),
                 signal: controller.signal,
@@ -690,7 +701,11 @@ class RequestHandler {
                 `[LoadBalancer] Assigned request ${req.method} ${req.path} to account #${lease.authIndex}` +
                     (affinityPin ? ` (affinity: ${affinityPin.source} -> account #${affinityPin.authIndex})` : "")
             );
-            return await this.accountRequestContext.run({ lease }, callback);
+            const recordResult = () => {
+                if (model && policy && res.statusCode >= 200 && res.statusCode < 300) policy.clear(lease.authIndex, model);
+            };
+            res.once("finish", recordResult);
+            return await this.accountRequestContext.run({ lease, model }, callback);
         } catch (error) {
             if (!res.headersSent && !res.writableEnded) {
                 if (error.name === "AbortError") return;
@@ -726,9 +741,15 @@ class RequestHandler {
             return false;
         }
         const sourceAuthIndex = lease.authIndex;
+        const model = this.accountRequestContext.getStore?.()?.model;
+        const message = String(errorDetails?.message || "");
+        if (model && /(?:requires|only available|only supported|subscription|pro or ultra|paid tier|upgrade)/i.test(message) && /(?:model|subscription|tier|pro|ultra|upgrade)/i.test(message)) {
+            this.serverSystem.accountRoutingPolicy?.markUnsupported(sourceAuthIndex, model);
+        }
         attemptedAuthIndices.add(sourceAuthIndex);
         await lease.move({
             exclude: attemptedAuthIndices,
+            failFast: Number(errorDetails?.status) === 403,
             release: { status: Number(errorDetails?.status) },
         });
         attemptedAuthIndices.add(lease.authIndex);
@@ -1208,6 +1229,12 @@ class RequestHandler {
     }
 
     async _handleRequestFailure(errorDetails, sendErrorCallback = null) {
+        const requestStore = this.accountRequestContext.getStore();
+        const errorMessage = String(errorDetails?.message || "");
+        if (requestStore?.model && requestStore?.lease && /(?:requires|only available|only supported|subscription|pro or ultra|paid tier|upgrade)/i.test(errorMessage) && /(?:model|subscription|tier|pro|ultra|upgrade)/i.test(errorMessage)) {
+            this.serverSystem.accountRoutingPolicy?.markUnsupported(requestStore.lease.authIndex, requestStore.model);
+        }
+
         // A transient 404 is not an account quota/auth failure.
         if (Number(errorDetails?.status) === 404) return;
         if (this.config.accountLoadBalancing && this.accountRequestContext.getLease()) {
@@ -4005,6 +4032,36 @@ class RequestHandler {
                 this._cancelCurrentAttemptBeforeRetry(proxyRequest, currentQueueAuthIndex);
 
                 const errorStatus = Number(errorPayload?.status);
+                // 403 is an upstream rejection, not proof of subscription tier. Temporarily
+                // avoid this account/model pair and never replay it on the same account.
+                if (errorStatus === 403 && proxyRequest.is_generative && !isUserAbortedError(errorPayload)) {
+                    const modelName = this._extractModelFromPath(proxyRequest.path);
+                    if (modelName && Number.isInteger(currentQueueAuthIndex)) {
+                        try { this.serverSystem.accountRoutingPolicy?.noteDenied(currentQueueAuthIndex, modelName); }
+                        catch (e) { this.logger.warn(`[Routing] Unable to save model cooldown: ${e.name}`); }
+                    }
+                    if (this._isPinnedRequest(immediateSwitchTracker) || !this.config.accountLoadBalancing || !this.accountRequestContext.getLease()) {
+                        lastError = { ...errorPayload, skipAccountSwitch: true }; break;
+                    }
+                    if (retryAttempt >= this.config.maxRetries) { lastError = { ...errorPayload, skipAccountSwitch: true }; break; }
+                    try {
+                        const moved = await this._moveCurrentAccountLease(errorPayload, immediateSwitchTracker.attemptedAuthIndices);
+                        const nextIndex = this.accountRequestContext.getLease()?.authIndex;
+                        if (!moved || !Number.isInteger(nextIndex) || nextIndex === currentQueueAuthIndex) {
+                            lastError = { ...errorPayload, skipAccountSwitch: true }; break;
+                        }
+                        try { currentQueue.close("retry_account_403"); } catch {}
+                        this._advanceProxyRequestAttempt(proxyRequest);
+                        currentQueue = this.connectionRegistry.createMessageQueue(proxyRequest.request_id, nextIndex, proxyRequest.request_attempt_id);
+                        currentQueueAuthIndex = nextIndex;
+                        retryAttempt++;
+                        continue;
+                    } catch (switchError) {
+                        this.logger.warn(`[Routing] No alternate account for 403: ${switchError.name}`);
+                        lastError = { ...errorPayload, skipAccountSwitch: true }; break;
+                    }
+                }
+
                 // Retry before sending any response. Keep the same file-owner/account,
                 // but use a new attempt ID/queue so late messages cannot contaminate retries.
                 if (errorStatus === 404 && proxyRequest.is_generative && !isUserAbortedError(errorPayload)) {

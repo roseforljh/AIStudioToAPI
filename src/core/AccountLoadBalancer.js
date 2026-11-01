@@ -74,7 +74,7 @@ class AccountLoadBalancer {
         const now = this.now();
         const eligible = [...new Set(this.getEligibleAuthIndices())]
             .filter(authIndex => Number.isInteger(authIndex) && authIndex >= 0)
-            .filter(authIndex => !excluded.has(authIndex))
+            .filter(authIndex => !excluded.has(authIndex) && (!options.allowed || options.allowed.has(authIndex)))
             .map(authIndex => ({ authIndex, state: this._getState(authIndex) }))
             .filter(({ state }) => state.cooldownUntil <= now)
             .filter(({ state }) => state.activeRequests < this.maxConcurrentPerAccount);
@@ -92,7 +92,7 @@ class AccountLoadBalancer {
             }
 
             const preferredState = this._getState(preferred);
-            const preferredEligible = [...new Set(this.getEligibleAuthIndices())].includes(preferred);
+            const preferredEligible = (!options.allowed || options.allowed.has(preferred)) && [...new Set(this.getEligibleAuthIndices())].includes(preferred);
             if (preferredEligible && !excluded.has(preferred) && preferredState.cooldownUntil <= now) {
                 // 账号本身健康、只是并发槽位被占满：宁愿排队等待，也不要换号。
                 return null;
@@ -114,9 +114,9 @@ class AccountLoadBalancer {
         // 所有账号都在冷却（或槽位全满）时，宁可回退到“最快解冻”的账号重试一次，
         // 也不要让前端直接拿到 503 —— 上游 403 常常只对某一类请求生效，
         // 换个账号往往是通的。粘性请求（requirePreferred）例外：换号等于上游 500。
-        if (options.requirePreferred) return null;
+        if (options.requirePreferred || options.noCoolingFallback) return null;
         const fallback = [...new Set(this.getEligibleAuthIndices())]
-            .filter(authIndex => Number.isInteger(authIndex) && authIndex >= 0 && !excluded.has(authIndex))
+            .filter(authIndex => Number.isInteger(authIndex) && authIndex >= 0 && !excluded.has(authIndex) && (!options.allowed || options.allowed.has(authIndex)))
             .map(authIndex => ({ authIndex, state: this._getState(authIndex) }))
             .filter(({ state }) => state.activeRequests < this.maxConcurrentPerAccount)
             .sort((a, b) => a.state.cooldownUntil - b.state.cooldownUntil);
@@ -215,7 +215,7 @@ class AccountLoadBalancer {
         this._drainWaiters();
     }
 
-    _createLease(authIndex) {
+    _createLease(authIndex, allowed = null, noCoolingFallback = false) {
         const balancer = this;
         let released = false;
         let currentAuthIndex = authIndex;
@@ -235,7 +235,7 @@ class AccountLoadBalancer {
                 const previousCooldownUntil = previousState.cooldownUntil;
                 balancer._release(previousAuthIndex, releaseOptions);
                 try {
-                    const replacement = await balancer.acquire(options);
+                    const replacement = await balancer.acquire({ ...options, allowed: options.allowed || allowed, noCoolingFallback: options.noCoolingFallback ?? noCoolingFallback });
                     currentAuthIndex = replacement.authIndex;
                     replacement._transfer();
                     return currentAuthIndex;
@@ -261,23 +261,27 @@ class AccountLoadBalancer {
         const exclude = this._normalizeExcluded(options.exclude);
         const preferredAuthIndex = this._normalizePreferredAuthIndex(options.preferredAuthIndex);
         const requirePreferred = options.requirePreferred === true;
+        const allowed = options.allowed instanceof Set ? options.allowed : null;
         const globalLimit = this._getGlobalConcurrencyLimit();
         const authIndex =
             globalLimit > 0 && this._getActiveRequestCount() < globalLimit
-                ? this._selectAuthIndex(exclude, preferredAuthIndex, { requirePreferred })
+                ? this._selectAuthIndex(exclude, preferredAuthIndex, { requirePreferred, allowed, noCoolingFallback: options.noCoolingFallback })
                 : null;
         if (authIndex !== null) {
             this._reserve(authIndex);
-            return Promise.resolve(this._createLease(authIndex));
+            return Promise.resolve(this._createLease(authIndex, allowed, options.noCoolingFallback));
         }
 
         const signal = options.signal;
+        if (options.failFast && authIndex === null) return Promise.reject(new AccountAcquireTimeoutError("No eligible account is immediately available"));
         if (signal?.aborted) return Promise.reject(this._createAbortError());
         const timeoutMs = Math.max(1, Number(options.timeoutMs) || this.acquireTimeoutMs);
 
         return new Promise((resolve, reject) => {
             const waiter = {
                 abortHandler: null,
+                allowed,
+                noCoolingFallback: options.noCoolingFallback,
                 exclude,
                 preferredAuthIndex,
                 reject,
@@ -328,12 +332,14 @@ class AccountLoadBalancer {
             if (globalLimit <= 0 || this._getActiveRequestCount() >= globalLimit) break;
             const authIndex = this._selectAuthIndex(waiter.exclude, waiter.preferredAuthIndex, {
                 requirePreferred: waiter.requirePreferred === true,
+                allowed: waiter.allowed,
+                noCoolingFallback: waiter.noCoolingFallback,
             });
             if (authIndex === null) continue;
             this._removeWaiter(waiter);
             waiter.cleanup();
             this._reserve(authIndex);
-            waiter.resolve(this._createLease(authIndex));
+            waiter.resolve(this._createLease(authIndex, waiter.allowed, waiter.noCoolingFallback));
         }
     }
 

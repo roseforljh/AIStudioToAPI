@@ -1,3 +1,4 @@
+const { BuildBenefitContext } = require("./BuildBenefitContext");
 const { MakerSuiteBridge } = require("./MakerSuiteBridge");
 /**
  * File: src/core/BrowserManager.js
@@ -570,6 +571,7 @@ class BrowserManager {
                 return;
             }
 
+            const previousBenefit = this.benefitScanner?.get(authIndex);
             const storageState = await contextData.context.storageState();
 
             // Merge new credentials into existing data
@@ -581,6 +583,12 @@ class BrowserManager {
 
             // Overwrite the file with merged data
             await fs.promises.writeFile(authFilePath, JSON.stringify(authData, null, 2));
+            // This write originates from the same live context, so preserve its observed tier
+            // across cookie rotation. External file replacements remain fingerprint-invalidated.
+            if (previousBenefit && this.benefitScanner) {
+                const newHash = this.benefitScanner.fingerprint(authIndex);
+                if (newHash) this.benefitScanner.save(authIndex, newHash, previousBenefit.state, previousBenefit.lastError);
+            }
 
             this.logger.info(`[Auth Update] 💾 Successfully updated auth credentials for account #${authIndex}`);
         } catch (error) {
@@ -1476,7 +1484,7 @@ class BrowserManager {
      * @returns {Promise<{firstReady: number|null}>}
      */
     async preloadContextPool(startupOrder, maxContexts) {
-        if (this.config.accountLoadBalancing) startupOrder = this._poolRotation.order(startupOrder);
+        if (this.config.accountLoadBalancing) startupOrder = this.accountRoutingPolicy ? this.accountRoutingPolicy.order(startupOrder) : this._poolRotation.order(startupOrder);
         const poolSize = maxContexts === 0 ? startupOrder.length : Math.min(maxContexts, startupOrder.length);
         this.logger.info(
             `🚀 [ContextPool] Starting pool preload (pool=${poolSize}, order=[${startupOrder.join(", ")}])...`
@@ -1552,7 +1560,7 @@ class BrowserManager {
             ordered.push(rotation[(startPos + i) % rotation.length]);
         }
 
-        if (this.config.accountLoadBalancing) ordered.splice(0, ordered.length, ...this._poolRotation.order(rotation));
+        if (this.config.accountLoadBalancing) ordered.splice(0, ordered.length, ...(this.accountRoutingPolicy ? this.accountRoutingPolicy.targets(this.accountRoutingPolicy.order(rotation)) : this._poolRotation.order(rotation)));
         // Calculate how many more contexts we need to reach poolSize
         const needCount = poolSize - this.contexts.size;
         if (needCount > 0) {
@@ -2087,6 +2095,9 @@ class BrowserManager {
      * The remaining warm contexts stay as hot standby and are NOT called.
      */
     selectActiveAuthIndices(readyIndices) {
+        if (this.config.accountLoadBalancing && this.accountRoutingPolicy) {
+            return this.accountRoutingPolicy.choose(readyIndices || [], index => this._isAccountUnavailable(index));
+        }
         if (this.config.accountLoadBalancing) {
             const ready = new Set(
                 (readyIndices || []).filter(i => Number.isInteger(i) && i >= 0 && !this._isAccountUnavailable(i))
@@ -2185,17 +2196,17 @@ class BrowserManager {
     async _rebalanceStablePool() {
         const rotation = this.authSource.getRotationIndices();
         const valid = new Set(rotation);
+        const targetSet = this.accountRoutingPolicy ? new Set(this.accountRoutingPolicy.targets(rotation.filter(i => !this._isAccountUnavailable(i)))) : null;
         const stale = [...this.contexts.keys()].filter(
-            i => !valid.has(this.authSource.getCanonicalIndex(i) ?? i) || this.isAccountDeprioritized(i)
+            i => !valid.has(this.authSource.getCanonicalIndex(i) ?? i) || this.isAccountDeprioritized(i) || (targetSet && !targetSet.has(i))
         );
         const { busy, idle } = this._prioritizeContextsForRemoval(stale);
         for (const i of idle) await this._closeContextForPoolIfPossible(i, "stable_backfill");
         for (const entry of busy) this._scheduleContextClosureWhenIdle(entry.authIndex, "stable_backfill");
         const cap = this.config.maxContexts;
         const occupancy = this.contexts.size + this.initializingContexts.size;
-        const candidates = this._poolRotation
-            .order(rotation)
-            .filter(i => !this.contexts.has(i) && !this.initializingContexts.has(i) && !this._isAccountUnavailable(i));
+        const candidates = (this.accountRoutingPolicy ? this.accountRoutingPolicy.order(rotation) : this._poolRotation.order(rotation))
+            .filter(i => (!targetSet || targetSet.has(i)) && !this.contexts.has(i) && !this.initializingContexts.has(i) && !this._isAccountUnavailable(i));
         this.logger.info(
             "[PoolRotation] retained=[" +
                 [...this.contexts.keys()].join(",") +
@@ -2394,6 +2405,9 @@ class BrowserManager {
             await context.addInitScript(privacyScript);
 
             page = await context.newPage();
+            page.buildBenefit = new BuildBenefitContext(page, { authIndex });
+            page.buildBenefit.dispatcher = true;
+            await page.buildBenefit.install();
             page.makerSuiteBridge = new MakerSuiteBridge({ page, context, logger: this.logger, authIndex });
             await page.makerSuiteBridge.install();
 

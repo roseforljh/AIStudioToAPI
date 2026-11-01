@@ -155,523 +155,19 @@
                     <h1>{{ t("statusHeading") }}</h1>
                 </header>
 
-                <div class="dashboard-grid">
-                    <!-- Service Status Card -->
-                    <div class="status-card">
-                        <h3 class="card-title">
-                            <svg
-                                xmlns="http://www.w3.org/2000/svg"
-                                width="18"
-                                height="18"
-                                viewBox="0 0 24 24"
-                                fill="none"
-                                stroke="currentColor"
-                                stroke-width="2"
-                                stroke-linecap="round"
-                                stroke-linejoin="round"
-                                style="margin-right: 8px; vertical-align: text-bottom"
-                            >
-                                <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline>
-                            </svg>
-                            {{ t("serviceStatus") }}
-                            <span
-                                class="dot"
-                                :class="state.serviceConnected ? 'status-running' : 'status-error'"
-                                style="display: inline-block; vertical-align: middle; margin-left: 8px"
-                            ></span>
-                        </h3>
-                        <div class="status-list">
-                            <div class="status-item">
-                                <span class="label">
-                                    <svg
-                                        xmlns="http://www.w3.org/2000/svg"
-                                        width="14"
-                                        height="14"
-                                        viewBox="0 0 24 24"
-                                        fill="none"
-                                        stroke="currentColor"
-                                        stroke-width="2"
-                                        stroke-linecap="round"
-                                        stroke-linejoin="round"
-                                        style="margin-right: 6px; vertical-align: middle"
-                                    >
-                                        <path d="M20 8h-2"></path>
-                                        <path d="M20 18h-2"></path>
-                                        <rect x="2" y="4" width="20" height="8" rx="2" ry="2"></rect>
-                                        <rect x="2" y="14" width="20" height="8" rx="2" ry="2"></rect>
-                                        <line x1="6" y1="8" x2="6.01" y2="8"></line>
-                                        <line x1="6" y1="18" x2="6.01" y2="18"></line>
-                                    </svg>
-                                    {{ t("serviceConnection") }}
-                                </span>
-                                <span class="value status-text-bold" :class="serviceConnectedClass">{{
-                                    serviceConnectedText
-                                }}</span>
-                            </div>
-                            <div v-if="state.serviceConnected" class="status-item">
-                                <span class="label">
-                                    <svg
-                                        xmlns="http://www.w3.org/2000/svg"
-                                        width="14"
-                                        height="14"
-                                        viewBox="0 0 24 24"
-                                        fill="none"
-                                        stroke="currentColor"
-                                        stroke-width="2"
-                                        stroke-linecap="round"
-                                        stroke-linejoin="round"
-                                        style="margin-right: 6px; vertical-align: middle"
-                                    >
-                                        <path d="M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z"></path>
-                                    </svg>
-                                    {{ t("browserConnection") }}
-                                </span>
-                                <span class="value status-text-bold" :class="browserConnectedClass">{{
-                                    browserConnectedText
-                                }}</span>
-                            </div>
+                <div class="overview-grid">
+                    <section class="status-card overview-card">
+                        <h3 class="card-title">{{ state.currentLang === 'zh' ? '运行概览' : 'Service overview' }}</h3>
+                        <div class="overview-metrics">
+                            <div class="overview-metric"><span class="label">{{ t("serviceConnection") }}</span><strong :class="serviceConnectedClass">{{ serviceConnectedText }}</strong></div>
+                            <div class="overview-metric"><span class="label">{{ t("browserConnection") }}</span><strong :class="browserConnectedClass">{{ browserConnectedText }}</strong></div>
+                            <div class="overview-metric"><span class="label">{{ state.currentLang === 'zh' ? '已登录账号' : 'Connected accounts' }}</span><strong>{{ state.accountDetails.filter(item => item.isReady).length }} / {{ state.maxContexts || '∞' }}</strong></div>
+                            <div class="overview-metric"><span class="label">VIP · {{ state.currentLang === 'zh' ? '活跃 / 预备' : 'Active / standby' }}</span><strong><span class="overview-active">{{ state.accountDetails.filter(item => item.benefitState === 'ready-paid' && item.isActive).length }}</span> / <span class="overview-standby">{{ state.accountDetails.filter(item => item.benefitState === 'ready-paid' && item.isStandby).length }}</span></strong></div>
+                            <div class="overview-metric"><span class="label">{{ state.currentLang === 'zh' ? '普通 · 活跃 / 预备' : 'Standard · Active / standby' }}</span><strong><span class="overview-active">{{ state.accountDetails.filter(item => item.benefitState !== 'ready-paid' && item.isActive).length }}</span> / <span class="overview-standby">{{ state.accountDetails.filter(item => item.benefitState !== 'ready-paid' && item.isStandby).length }}</span></strong></div>
+                            <div class="overview-metric"><span class="label">{{ t("loadBalancerConcurrency") }}</span><strong>{{ state.accountLoadBalancerActiveRequests }} / {{ state.accountLoadBalancerLimit || '−' }}</strong></div>
+                            <div class="overview-metric"><span class="label">{{ t("requestsLastMinute") }}</span><strong>{{ state.requestsLastMinute }}</strong></div>
                         </div>
-                    </div>
-
-                    <!-- Account Status Card -->
-                    <div v-if="state.serviceConnected" class="status-card">
-                        <h3 class="card-title">
-                            <svg
-                                xmlns="http://www.w3.org/2000/svg"
-                                width="18"
-                                height="18"
-                                viewBox="0 0 24 24"
-                                fill="none"
-                                stroke="currentColor"
-                                stroke-width="2"
-                                stroke-linecap="round"
-                                stroke-linejoin="round"
-                                style="margin-right: 8px; vertical-align: text-bottom"
-                            >
-                                <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
-                                <circle cx="12" cy="7" r="4"></circle>
-                            </svg>
-                            {{ t("accountStatus") }}
-                        </h3>
-                        <div class="status-list">
-                            <div class="status-item">
-                                <span class="label">
-                                    <svg
-                                        xmlns="http://www.w3.org/2000/svg"
-                                        width="14"
-                                        height="14"
-                                        viewBox="0 0 24 24"
-                                        fill="none"
-                                        stroke="currentColor"
-                                        stroke-width="2"
-                                        stroke-linecap="round"
-                                        stroke-linejoin="round"
-                                        style="margin-right: 6px; vertical-align: middle"
-                                    >
-                                        <path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
-                                        <circle cx="8.5" cy="7" r="4"></circle>
-                                        <polyline points="17 11 19 13 23 9"></polyline>
-                                    </svg>
-                                    {{ t("currentAccount") }}
-                                </span>
-                                <span class="value account-value">
-                                    <span class="account-name" :class="currentAccountNameClass">
-                                        #{{ state.currentAuthIndex }} {{ currentAccountName }}
-                                    </span>
-                                </span>
-                            </div>
-                            <div class="status-item">
-                                <span class="label">
-                                    <svg
-                                        xmlns="http://www.w3.org/2000/svg"
-                                        width="14"
-                                        height="14"
-                                        viewBox="0 0 24 24"
-                                        fill="none"
-                                        stroke="currentColor"
-                                        stroke-width="2"
-                                        stroke-linecap="round"
-                                        stroke-linejoin="round"
-                                        style="margin-right: 6px; vertical-align: middle"
-                                    >
-                                        <line x1="18" y1="20" x2="18" y2="10"></line>
-                                        <line x1="12" y1="20" x2="12" y2="4"></line>
-                                        <line x1="6" y1="20" x2="6" y2="14"></line>
-                                    </svg>
-                                    <span>
-                                        {{ t("usageCount") }}
-                                        <EnvVarTooltip env-var="SWITCH_ON_USES" doc-section="proxy-config" />
-                                    </span>
-                                </span>
-                                <span class="value">{{ state.usageCount }}</span>
-                            </div>
-                            <div class="status-item">
-                                <span class="label">
-                                    <svg
-                                        xmlns="http://www.w3.org/2000/svg"
-                                        width="14"
-                                        height="14"
-                                        viewBox="0 0 24 24"
-                                        fill="none"
-                                        stroke="currentColor"
-                                        stroke-width="2"
-                                        stroke-linecap="round"
-                                        stroke-linejoin="round"
-                                        style="margin-right: 6px; vertical-align: middle"
-                                    >
-                                        <path
-                                            d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"
-                                        ></path>
-                                        <line x1="12" y1="9" x2="12" y2="13"></line>
-                                        <line x1="12" y1="17" x2="12.01" y2="17"></line>
-                                    </svg>
-                                    <span>
-                                        {{ t("consecutiveFailures") }}
-                                        <EnvVarTooltip env-var="FAILURE_THRESHOLD" doc-section="proxy-config" />
-                                    </span>
-                                </span>
-                                <span class="value">{{ state.failureCount }}</span>
-                            </div>
-                            <div class="status-item">
-                                <span class="label">
-                                    <svg
-                                        xmlns="http://www.w3.org/2000/svg"
-                                        width="14"
-                                        height="14"
-                                        viewBox="0 0 24 24"
-                                        fill="none"
-                                        stroke="currentColor"
-                                        stroke-width="2"
-                                        stroke-linecap="round"
-                                        stroke-linejoin="round"
-                                        style="margin-right: 6px; vertical-align: middle"
-                                    >
-                                        <polygon points="12 2 2 7 12 12 22 7 12 2"></polygon>
-                                        <polyline points="2 17 12 22 22 17"></polyline>
-                                        <polyline points="2 12 12 17 22 12"></polyline>
-                                    </svg>
-                                    {{ t("totalScanned") }}
-                                </span>
-                                <span class="value">{{ totalScannedCount }}</span>
-                            </div>
-                            <div class="status-item">
-                                <span class="label">
-                                    <svg
-                                        xmlns="http://www.w3.org/2000/svg"
-                                        width="14"
-                                        height="14"
-                                        viewBox="0 0 24 24"
-                                        fill="none"
-                                        stroke="currentColor"
-                                        stroke-width="2"
-                                        stroke-linecap="round"
-                                        stroke-linejoin="round"
-                                        style="margin-right: 6px; vertical-align: middle"
-                                    >
-                                        <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"></polygon>
-                                    </svg>
-                                    {{ t("dedupedAvailable") }}
-                                </span>
-                                <span class="value">{{ dedupedAvailableCount }}</span>
-                            </div>
-                            <div class="status-item">
-                                <span class="label">
-                                    <svg
-                                        xmlns="http://www.w3.org/2000/svg"
-                                        width="14"
-                                        height="14"
-                                        viewBox="0 0 24 24"
-                                        fill="none"
-                                        stroke="currentColor"
-                                        stroke-width="2"
-                                        stroke-linecap="round"
-                                        stroke-linejoin="round"
-                                        style="margin-right: 6px; vertical-align: middle"
-                                    >
-                                        <rect x="2" y="7" width="20" height="14" rx="2" ry="2"></rect>
-                                        <path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"></path>
-                                    </svg>
-                                    <span>
-                                        {{ t("activeContexts") }}
-                                        <EnvVarTooltip env-var="MAX_CONTEXTS" doc-section="proxy-config" />
-                                    </span>
-                                </span>
-                                <span class="value">{{ activeContextsDisplay }}</span>
-                            </div>
-                        </div>
-                    </div>
-
-                    <!-- Recent Load Balancing Card -->
-                    <div v-if="state.serviceConnected" class="status-card recent-load-card">
-                        <h3 class="card-title">{{ t("recentLoadBalancing") }}</h3>
-                        <div class="status-list">
-                            <div class="status-item">
-                                <span class="label">{{ t("activeRequests") }}</span>
-                                <span class="value">{{ state.activeRequests }}</span>
-                            </div>
-                            <div class="status-item">
-                                <span class="label">{{ t("requestsLastMinute") }}</span>
-                                <span class="value">{{ state.requestsLastMinute }}</span>
-                            </div>
-                            <div class="status-item">
-                                <span class="label">{{ t("loadBalancerConcurrency") }}</span>
-                                <span class="value"
-                                    >{{ state.accountLoadBalancerActiveRequests }} /
-                                    {{ state.accountLoadBalancerLimit || "-" }}</span
-                                >
-                            </div>
-                            <div class="status-item status-item-column">
-                                <span class="label">{{ t("accountsLastMinute") }}</span>
-                                <div class="recent-account-list">
-                                    <span
-                                        v-for="account in state.accountsLastMinute"
-                                        :key="account.key"
-                                        class="recent-account-chip"
-                                    >
-                                        #{{ account.authIndex }} {{ account.accountName || "N/A" }} ·
-                                        {{ account.count }}
-                                    </span>
-                                    <span v-if="state.accountsLastMinute.length === 0" class="muted-text">-</span>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-
-                    <!-- Proxy Settings Status Card -->
-                    <div v-if="state.serviceConnected" class="status-card">
-                        <h3 class="card-title">
-                            <svg
-                                xmlns="http://www.w3.org/2000/svg"
-                                width="18"
-                                height="18"
-                                viewBox="0 0 24 24"
-                                fill="none"
-                                stroke="currentColor"
-                                stroke-width="2"
-                                stroke-linecap="round"
-                                stroke-linejoin="round"
-                                style="margin-right: 8px; vertical-align: text-bottom"
-                            >
-                                <path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"></path>
-                            </svg>
-                            {{ t("proxySettingsStatus") }}
-                        </h3>
-                        <div class="status-list">
-                            <div class="status-item">
-                                <span class="label">
-                                    <svg
-                                        xmlns="http://www.w3.org/2000/svg"
-                                        width="14"
-                                        height="14"
-                                        viewBox="0 0 24 24"
-                                        fill="none"
-                                        stroke="currentColor"
-                                        stroke-width="2"
-                                        stroke-linecap="round"
-                                        stroke-linejoin="round"
-                                        style="margin-right: 6px; vertical-align: middle"
-                                    >
-                                        <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
-                                    </svg>
-                                    <span>
-                                        {{ t("streamingMode") }}
-                                        <span
-                                            style="
-                                                font-size: 0.8em;
-                                                color: var(--text-secondary);
-                                                font-weight: normal;
-                                                margin-left: 4px;
-                                            "
-                                            >({{ t("onlyAppliesWhenStreamingEnabled") }})</span
-                                        >
-                                        <EnvVarTooltip env-var="STREAMING_MODE" doc-section="other-config" />
-                                    </span>
-                                </span>
-                                <span
-                                    class="value status-text-bold"
-                                    :class="state.streamingModeReal ? 'status-ok' : 'status-error'"
-                                    >{{ state.streamingModeReal ? t("real") : t("fake") }}</span
-                                >
-                            </div>
-                            <div class="status-item">
-                                <span class="label">
-                                    <svg
-                                        xmlns="http://www.w3.org/2000/svg"
-                                        width="14"
-                                        height="14"
-                                        viewBox="0 0 24 24"
-                                        fill="none"
-                                        stroke="currentColor"
-                                        stroke-width="2"
-                                        stroke-linecap="round"
-                                        stroke-linejoin="round"
-                                        style="margin-right: 6px; vertical-align: middle"
-                                    >
-                                        <path d="M15.5 13a3.5 3.5 0 0 0 -3.5 3.5v1a3.5 3.5 0 0 0 7 0v-1.8"></path>
-                                        <path d="M8.5 13a3.5 3.5 0 0 1 3.5 3.5v1a3.5 3.5 0 0 1 -7 0v-1.8"></path>
-                                        <path d="M17.5 16a3.5 3.5 0 0 0 0 -7h-.5"></path>
-                                        <path d="M19 9.3v-2.8a3.5 3.5 0 0 0 -7 0"></path>
-                                        <path d="M6.5 16a3.5 3.5 0 0 1 0 -7h.5"></path>
-                                        <path d="M5 9.3v-2.8a3.5 3.5 0 0 1 7 0v10"></path>
-                                    </svg>
-                                    <span>
-                                        {{ t("forceThinking") }}
-                                        <EnvVarTooltip env-var="FORCE_THINKING" doc-section="other-config" />
-                                    </span>
-                                </span>
-                                <span
-                                    class="value status-text-bold"
-                                    :class="state.forceThinkingEnabled ? 'status-ok' : 'status-error'"
-                                    >{{ state.forceThinkingEnabled ? t("enabled") : t("disabled") }}</span
-                                >
-                            </div>
-                            <div class="status-item">
-                                <span class="label">
-                                    <svg
-                                        xmlns="http://www.w3.org/2000/svg"
-                                        width="14"
-                                        height="14"
-                                        viewBox="0 0 24 24"
-                                        fill="none"
-                                        stroke="currentColor"
-                                        stroke-width="2"
-                                        stroke-linecap="round"
-                                        stroke-linejoin="round"
-                                        style="margin-right: 6px; vertical-align: middle"
-                                    >
-                                        <circle cx="12" cy="12" r="10"></circle>
-                                        <line x1="2" y1="12" x2="22" y2="12"></line>
-                                        <path
-                                            d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"
-                                        ></path>
-                                    </svg>
-                                    <span>
-                                        {{ t("forceWebSearch") }}
-                                        <EnvVarTooltip env-var="FORCE_WEB_SEARCH" doc-section="other-config" />
-                                    </span>
-                                </span>
-                                <span
-                                    class="value status-text-bold"
-                                    :class="state.forceWebSearchEnabled ? 'status-ok' : 'status-error'"
-                                    >{{ state.forceWebSearchEnabled ? t("enabled") : t("disabled") }}</span
-                                >
-                            </div>
-                            <div class="status-item">
-                                <span class="label">
-                                    <svg
-                                        xmlns="http://www.w3.org/2000/svg"
-                                        width="14"
-                                        height="14"
-                                        viewBox="0 0 24 24"
-                                        fill="none"
-                                        stroke="currentColor"
-                                        stroke-width="2"
-                                        stroke-linecap="round"
-                                        stroke-linejoin="round"
-                                        style="margin-right: 6px; vertical-align: middle"
-                                    >
-                                        <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path>
-                                        <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path>
-                                    </svg>
-                                    <span>
-                                        {{ t("forceUrlContext") }}
-                                        <EnvVarTooltip env-var="FORCE_URL_CONTEXT" doc-section="other-config" />
-                                    </span>
-                                </span>
-                                <span
-                                    class="value status-text-bold"
-                                    :class="state.forceUrlContextEnabled ? 'status-ok' : 'status-error'"
-                                    >{{ state.forceUrlContextEnabled ? t("enabled") : t("disabled") }}</span
-                                >
-                            </div>
-                            <div class="status-item">
-                                <span class="label">
-                                    <svg
-                                        xmlns="http://www.w3.org/2000/svg"
-                                        width="14"
-                                        height="14"
-                                        viewBox="0 0 24 24"
-                                        fill="none"
-                                        stroke="currentColor"
-                                        stroke-width="2"
-                                        stroke-linecap="round"
-                                        stroke-linejoin="round"
-                                        style="margin-right: 6px; vertical-align: middle"
-                                    >
-                                        <polyline points="16 18 22 12 16 6"></polyline>
-                                        <polyline points="8 6 2 12 8 18"></polyline>
-                                    </svg>
-                                    <span>
-                                        {{ t("forceCodeExecution") }}
-                                        <EnvVarTooltip env-var="FORCE_CODE_EXECUTION" doc-section="other-config" />
-                                    </span>
-                                </span>
-                                <span
-                                    class="value status-text-bold"
-                                    :class="state.forceCodeExecutionEnabled ? 'status-ok' : 'status-error'"
-                                    >{{ state.forceCodeExecutionEnabled ? t("enabled") : t("disabled") }}</span
-                                >
-                            </div>
-                            <div class="status-item">
-                                <span class="label">
-                                    <svg
-                                        xmlns="http://www.w3.org/2000/svg"
-                                        width="14"
-                                        height="14"
-                                        viewBox="0 0 24 24"
-                                        fill="none"
-                                        stroke="currentColor"
-                                        stroke-width="2"
-                                        stroke-linecap="round"
-                                        stroke-linejoin="round"
-                                        style="margin-right: 6px; vertical-align: middle"
-                                    >
-                                        <path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"></path>
-                                        <path d="M21 3v5h-5"></path>
-                                    </svg>
-                                    <span>
-                                        {{ t("maxRetries") }}
-                                        <span
-                                            style="
-                                                font-size: 0.8em;
-                                                color: var(--text-secondary);
-                                                font-weight: normal;
-                                                margin-left: 4px;
-                                            "
-                                            >({{ t("onlyAppliesWhenFakeStreaming") }})</span
-                                        >
-                                        <EnvVarTooltip env-var="MAX_RETRIES" doc-section="proxy-config" />
-                                    </span>
-                                </span>
-                                <span class="value">{{ state.maxRetries }}</span>
-                            </div>
-                            <div class="status-item">
-                                <span class="label">
-                                    <svg
-                                        xmlns="http://www.w3.org/2000/svg"
-                                        width="14"
-                                        height="14"
-                                        viewBox="0 0 24 24"
-                                        fill="none"
-                                        stroke="currentColor"
-                                        stroke-width="2"
-                                        stroke-linecap="round"
-                                        stroke-linejoin="round"
-                                        style="margin-right: 6px; vertical-align: middle"
-                                    >
-                                        <path
-                                            d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"
-                                        ></path>
-                                    </svg>
-                                    <span>
-                                        {{ t("apiKey") }}
-                                        <EnvVarTooltip env-var="API_KEYS" doc-section="app-config" />
-                                    </span>
-                                </span>
-                                <span class="value status-text-bold">{{ apiKeySourceText }}</span>
-                            </div>
-                        </div>
-                    </div>
+                    </section>
                 </div>
 
                 <!-- Account Management Section (Full Width) -->
@@ -838,15 +334,28 @@
                                 </button>
                             </div>
                         </div>
-                        <!-- Account list -->
-                        <div class="account-list">
+                        <div class="benefit-scan-panel" aria-live="polite">
+                            <div class="benefit-toolbar">
+                                <el-button :loading="benefitChecking || state.benefitScan.running" :disabled="state.benefitScan.running" @click="checkBenefits">{{ state.benefitScan.running ? (state.currentLang === 'zh' ? '正在检测' : 'Checking') : (state.currentLang === 'zh' ? '重新检测全部账号权益' : 'Recheck all account benefits') }}</el-button>
+                                <small>{{ state.currentLang === 'zh' ? '自动逐个检测并保存，结果会实时归组。' : 'Accounts are checked and grouped automatically.' }}</small>
+                            </div>
+                            <div v-if="showBenefitProgress" class="benefit-progress">
+                                <div class="benefit-progress-heading"><strong>{{ state.benefitScan.running ? (state.currentLang === 'zh' ? '检测进度' : 'Scan progress') : (state.benefitScan.error ? (state.currentLang === 'zh' ? '检测中断' : 'Scan interrupted') : (state.currentLang === 'zh' ? '本轮检测完成' : 'Scan complete')) }}</strong><span>{{ state.benefitScan.completed }} / {{ state.benefitScan.total }}</span></div>
+                                <el-progress :percentage="benefitProgressPercent" :stroke-width="9" :show-text="false" :status="state.benefitScan.error ? 'exception' : undefined" />
+                                <div class="benefit-progress-caption">{{ state.benefitScan.running && state.benefitScan.currentIndex !== null ? (state.currentLang === 'zh' ? `正在检测账号 #${state.benefitScan.currentIndex}` : `Checking account #${state.benefitScan.currentIndex}`) : (state.benefitScan.running ? (state.currentLang === 'zh' ? '正在准备检测…' : 'Preparing scan…') : (state.benefitScan.error ? (state.currentLang === 'zh' ? '请稍后重新检测' : 'Please retry') : (state.currentLang === 'zh' ? '已按结果更新分组' : 'Groups updated'))) }}</div>
+                            </div>
+                        </div>
+                        <!-- Group only confirmed observations; unknown is never inferred as free. -->
+                        <section v-for="group in accountBenefitGroups" :key="group.key" class="account-benefit-group">
+                            <h4 class="account-group-title" :class="`group-${group.key}`">{{ group.label }} <span>{{ group.items.length }}</span></h4>
+                            <div class="account-list">
                             <div
-                                v-for="item in state.accountDetails"
+                                v-for="item in group.items"
                                 :key="item.index"
                                 class="account-list-item"
                                 style="cursor: pointer"
                                 :class="{
-                                    'is-current': item.index === state.currentAuthIndex,
+                                    'is-current': state.accountLoadBalancingEnabled ? item.isActive : item.index === state.currentAuthIndex,
                                     'is-selected': isAccountSelected(item.index),
                                 }"
                                 @click="toggleSelectAccount(item.index)"
@@ -872,9 +381,12 @@
                                         >
                                             {{ getAccountDisplayName(item) }}
                                         </span>
-                                        <span v-if="item.index === state.currentAuthIndex" class="current-badge">
+                                        <span v-if="state.accountLoadBalancingEnabled ? item.isActive : item.index === state.currentAuthIndex" class="current-badge">
                                             {{ t("tagCurrent") }}
                                         </span>
+                                        <span v-if="state.accountLoadBalancingEnabled && item.isStandby" class="standby-badge">{{ state.currentLang === 'zh' ? '预备' : 'Standby' }}</span>
+                                        <span v-if="item.benefitState === 'ready-paid'" class="benefit-paid">{{ state.currentLang === 'zh' ? '付费权益' : 'Paid benefit' }}</span>
+                                        <span v-else-if="item.benefitState === 'ready-free'" class="benefit-free">{{ state.currentLang === 'zh' ? '普通' : 'Standard' }}</span>
                                         <span v-if="item.accountIssue" class="account-health-issue"
                                             :class="{ 'is-permanent': item.accountIssue.deletable }"
                                             :title="'auth-' + item.index + '.json · ' + item.accountIssue.code + ': ' + item.accountIssue.message">
@@ -889,13 +401,12 @@
                                     <button
                                         class="btn-switch"
                                         :class="{
-                                            'is-active': item.index === state.currentAuthIndex,
-                                            'is-callable': item.isActive && item.index !== state.currentAuthIndex,
-                                            'is-fast': item.hasContext && !item.isActive && item.index !== state.currentAuthIndex,
+                                            'is-active': state.accountLoadBalancingEnabled ? item.isActive : item.index === state.currentAuthIndex,
+                                            'is-fast': state.accountLoadBalancingEnabled ? item.isStandby : item.isReady && item.index !== state.currentAuthIndex,
                                         }"
-                                        :disabled="isBusy || item.index === state.currentAuthIndex"
+                                        :disabled="isBusy || (state.accountLoadBalancingEnabled ? item.isActive : item.index === state.currentAuthIndex)"
                                         :title="
-                                            item.index === state.currentAuthIndex
+                                            (state.accountLoadBalancingEnabled ? item.isActive : item.index === state.currentAuthIndex)
                                                 ? t('currentAccount')
                                                 : item.hasContext
                                                   ? t('fastSwitch')
@@ -904,7 +415,7 @@
                                         @click.stop="switchAccountByIndex(item.index)"
                                     >
                                         <svg
-                                            v-if="item.index !== state.currentAuthIndex"
+                                            v-if="!(state.accountLoadBalancingEnabled ? item.isActive : item.index === state.currentAuthIndex)"
                                             xmlns="http://www.w3.org/2000/svg"
                                             width="16"
                                             height="16"
@@ -955,29 +466,17 @@
                                             <line x1="14" y1="11" x2="14" y2="17"></line>
                                         </svg>
                                     </button>
-                                    <button :title="t('download')" @click.stop="downloadAccountByIndex(item.index)">
-                                        <svg
-                                            xmlns="http://www.w3.org/2000/svg"
-                                            width="16"
-                                            height="16"
-                                            viewBox="0 0 24 24"
-                                            fill="none"
-                                            stroke="currentColor"
-                                            stroke-width="2"
-                                            stroke-linecap="round"
-                                            stroke-linejoin="round"
-                                        >
-                                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
-                                            <polyline points="7 10 12 15 17 10"></polyline>
-                                            <line x1="12" y1="15" x2="12" y2="3"></line>
-                                        </svg>
-                                    </button>
+                                    <el-dropdown trigger="click" @command="command => handleAccountMenu(command, item.index)">
+                                        <button class="btn-more" :title="state.currentLang === 'zh' ? '更多操作' : 'More actions'" @click.stop aria-label="More actions">
+                                            <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/></svg>
+                                        </button>
+                                        <template #dropdown><el-dropdown-menu><el-dropdown-item command="models">{{ state.currentLang === 'zh' ? '检测模型' : 'Check models' }}</el-dropdown-item><el-dropdown-item command="benefit">{{ state.currentLang === 'zh' ? '检测付费权益' : 'Check paid benefit' }}</el-dropdown-item><el-dropdown-item command="download">{{ t('download') }}</el-dropdown-item></el-dropdown-menu></template>
+                                    </el-dropdown>
                                 </div>
                             </div>
-                            <div v-if="state.accountDetails.length === 0" class="account-list-empty">
-                                {{ t("noActiveAccount") }}
+                            <div v-if="group.items.length === 0" class="account-list-empty">{{ state.currentLang === 'zh' ? '暂无账号' : 'No accounts' }}</div>
                             </div>
-                        </div>
+                        </section>
                     </div>
                 </div>
             </div>
@@ -989,192 +488,24 @@
                 </header>
 
                 <div class="dashboard-grid settings-grid">
-                    <!-- Version Information Card -->
+                    <!-- Fork build information -->
                     <div class="status-card">
-                        <h3 class="card-title">
-                            <svg
-                                xmlns="http://www.w3.org/2000/svg"
-                                width="18"
-                                height="18"
-                                viewBox="0 0 24 24"
-                                fill="none"
-                                stroke="currentColor"
-                                stroke-width="2"
-                                stroke-linecap="round"
-                                stroke-linejoin="round"
-                                style="margin-right: 8px; vertical-align: text-bottom"
-                            >
-                                <circle cx="12" cy="12" r="10"></circle>
-                                <line x1="12" y1="16" x2="12" y2="12"></line>
-                                <line x1="12" y1="8" x2="12.01" y2="8"></line>
-                            </svg>
-                            {{ t("versionInfo") }}
-                        </h3>
+                        <h3 class="card-title">{{ t("versionInfo") }}</h3>
                         <div class="status-list">
-                            <div class="status-item">
-                                <span class="label">
-                                    <svg
-                                        xmlns="http://www.w3.org/2000/svg"
-                                        width="14"
-                                        height="14"
-                                        viewBox="0 0 24 24"
-                                        fill="currentColor"
-                                        style="margin-right: 6px; vertical-align: middle"
-                                    >
-                                        <path
-                                            d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385c.6.105.825-.255.825-.57c0-.285-.015-1.23-.015-2.235c-3.015.555-3.795-.735-4.035-1.41c-.135-.345-.72-1.41-1.23-1.695c-.42-.225-1.02-.78-.015-.795c.945-.015 1.62.87 1.845 1.23c1.08 1.815 2.805 1.305 3.495.99c.105-.78.42-1.305.765-1.605c-2.67-.3-5.46-1.335-5.46-5.925c0-1.305.465-2.385 1.23-3.225c-.12-.3-.54-1.53.12-3.18c0 0 1.005-.315 3.3 1.23c.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23c.66 1.65.24 2.88.12 3.18c.765.84 1.23 1.905 1.23 3.225c0 4.605-2.805 5.625-5.475 5.925c.435.375.81 1.095.81 2.22c0 1.605-.015 2.895-.015 3.3c0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z"
-                                        />
-                                    </svg>
-                                    GitHub {{ t("repo") }}
-                                </span>
-                                <a href="https://github.com/iBUHub/AIStudioToAPI" target="_blank" class="repo-link">
-                                    iBUHub/AIStudioToAPI
-                                </a>
-                            </div>
-                            <div class="status-item">
-                                <span class="label">
-                                    <svg
-                                        xmlns="http://www.w3.org/2000/svg"
-                                        width="14"
-                                        height="14"
-                                        viewBox="0 0 24 24"
-                                        fill="none"
-                                        stroke="currentColor"
-                                        stroke-width="2"
-                                        stroke-linecap="round"
-                                        stroke-linejoin="round"
-                                        style="margin-right: 6px; vertical-align: middle"
-                                    >
-                                        <path d="m19 21-7-4-7 4V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v16z"></path>
-                                    </svg>
-                                    {{ t("currentVersion") }}
-                                </span>
-                                <span class="value">
-                                    <span class="clickable-version" :title="t('copy')" @click="copyAppVersion">
-                                        {{ appVersion }}
-                                        <span class="copy-icon">
-                                            <svg
-                                                xmlns="http://www.w3.org/2000/svg"
-                                                width="14"
-                                                height="14"
-                                                viewBox="0 0 24 24"
-                                                fill="none"
-                                                stroke="currentColor"
-                                                stroke-width="2"
-                                                stroke-linecap="round"
-                                                stroke-linejoin="round"
-                                            >
-                                                <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
-                                                <path
-                                                    d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"
-                                                ></path>
-                                            </svg>
-                                        </span>
-                                    </span>
-                                </span>
-                            </div>
-                            <div class="status-item">
-                                <span class="label">
-                                    <svg
-                                        xmlns="http://www.w3.org/2000/svg"
-                                        width="14"
-                                        height="14"
-                                        viewBox="0 0 24 24"
-                                        fill="none"
-                                        stroke="currentColor"
-                                        stroke-width="2"
-                                        stroke-linecap="round"
-                                        stroke-linejoin="round"
-                                        style="margin-right: 6px; vertical-align: middle"
-                                    >
-                                        <circle cx="12" cy="13" r="8"></circle>
-                                        <path d="M12 9v4l2 2"></path>
-                                        <path d="m5 3 2 2"></path>
-                                        <path d="m19 3-2 2"></path>
-                                    </svg>
-                                    <span>
-                                        {{ t("latestVersion") }}
-                                        <EnvVarTooltip env-var="CHECK_UPDATE" doc-section="app-config" />
-                                    </span>
-                                </span>
-                                <span class="value">
-                                    <span
-                                        v-if="state.hasUpdate"
-                                        class="clickable-version"
-                                        :title="t('newVersionAvailable')"
-                                    >
-                                        <a
-                                            :href="
-                                                state.releaseUrl || 'https://github.com/iBUHub/AIStudioToAPI/releases'
-                                            "
-                                            target="_blank"
-                                            class="update-link"
-                                        >
-                                            {{ latestVersionFormatted }}
-                                        </a>
-                                        <a
-                                            class="copy-icon"
-                                            :href="
-                                                state.releaseUrl || 'https://github.com/iBUHub/AIStudioToAPI/releases'
-                                            "
-                                            target="_blank"
-                                            style="color: inherit; display: inline-flex"
-                                        >
-                                            <svg
-                                                xmlns="http://www.w3.org/2000/svg"
-                                                width="14"
-                                                height="14"
-                                                viewBox="0 0 24 24"
-                                                fill="none"
-                                                stroke="currentColor"
-                                                stroke-width="2"
-                                                stroke-linecap="round"
-                                                stroke-linejoin="round"
-                                            >
-                                                <path
-                                                    d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"
-                                                ></path>
-                                                <polyline points="15 3 21 3 21 9"></polyline>
-                                                <line x1="10" y1="14" x2="21" y2="3"></line>
-                                            </svg>
-                                        </a>
-                                    </span>
-                                    <span v-else class="clickable-version" :title="t('viewRelease')">
-                                        <a
-                                            href="https://github.com/iBUHub/AIStudioToAPI/releases"
-                                            target="_blank"
-                                            style="color: inherit; text-decoration: none"
-                                        >
-                                            {{ latestVersionFormatted }}
-                                        </a>
-                                        <a
-                                            class="copy-icon"
-                                            href="https://github.com/iBUHub/AIStudioToAPI/releases"
-                                            target="_blank"
-                                            style="color: inherit; display: inline-flex"
-                                        >
-                                            <svg
-                                                xmlns="http://www.w3.org/2000/svg"
-                                                width="14"
-                                                height="14"
-                                                viewBox="0 0 24 24"
-                                                fill="none"
-                                                stroke="currentColor"
-                                                stroke-width="2"
-                                                stroke-linecap="round"
-                                                stroke-linejoin="round"
-                                            >
-                                                <path
-                                                    d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"
-                                                ></path>
-                                                <polyline points="15 3 21 3 21 9"></polyline>
-                                                <line x1="10" y1="14" x2="21" y2="3"></line>
-                                            </svg>
-                                        </a>
-                                    </span>
-                                </span>
-                            </div>
+                            <div class="status-item"><span class="label">GitHub</span><a class="repo-link" href="https://github.com/roseforljh/AIStudioToAPI" target="_blank" rel="noopener noreferrer">roseforljh/AIStudioToAPI</a></div>
+                            <div class="status-item"><span class="label">{{ state.currentLang === 'zh' ? '分支' : 'Branch' }}</span><a class="repo-link" href="https://github.com/roseforljh/AIStudioToAPI/tree/feat/account-load-balancer" target="_blank" rel="noopener noreferrer">feat/account-load-balancer</a></div>
+                            <div class="status-item"><span class="label">{{ t("currentVersion") }}</span><span class="value clickable-version" :title="t('copy')" @click="copyAppVersion">{{ appVersion }}</span></div>
+                            <div class="version-note">{{ state.currentLang === 'zh' ? '当前为 fork 本地构建；不以官方发布版本代表 fork 更新状态。' : 'Local fork build; upstream releases do not indicate fork update status.' }}</div>
                         </div>
+                    </div>
+
+                    <div class="status-card account-pool-settings">
+                        <h3 class="card-title">{{ state.currentLang === 'zh' ? '账号池设置' : 'Account pools' }}</h3>
+                        <p class="pool-settings-hint">{{ state.currentLang === 'zh' ? '分别设置付费组与普通组的活跃账号和预备账号数量，保存后立即生效。未确认权益的账号暂放普通组。' : 'Set active and standby counts by group. Unconfirmed accounts are shown in Standard.' }}</p>
+                        <div class="pool-settings-grid">
+                            <strong>{{ state.currentLang === 'zh' ? '付费组' : 'Paid' }}</strong><label>{{ state.currentLang === 'zh' ? '活跃' : 'Active' }}<el-input-number v-model="poolSettings.paidActive" :min="0" :max="30" size="small" /></label><label>{{ state.currentLang === 'zh' ? '预备' : 'Standby' }}<el-input-number v-model="poolSettings.paidStandby" :min="0" :max="30" size="small" /></label>
+                            <strong>{{ state.currentLang === 'zh' ? '普通组' : 'Standard' }}</strong><label>{{ state.currentLang === 'zh' ? '活跃' : 'Active' }}<el-input-number v-model="poolSettings.normalActive" :min="0" :max="30" size="small" /></label><label>{{ state.currentLang === 'zh' ? '预备' : 'Standby' }}<el-input-number v-model="poolSettings.normalStandby" :min="0" :max="30" size="small" /></label>
+                        </div><el-button type="primary" :loading="poolSaving" @click="savePoolSettings">{{ state.currentLang === 'zh' ? '保存账号池设置' : 'Save account pools' }}</el-button>
                     </div>
 
                     <!-- System Settings Card -->
@@ -1236,34 +567,6 @@
                                     v-model="state.accountLoadBalancingEnabled"
                                     :width="50"
                                     :before-change="handleAccountLoadBalancingBeforeChange"
-                                />
-                            </div>
-                            <div class="switch-container">
-                                <span class="label">
-                                    <svg
-                                        xmlns="http://www.w3.org/2000/svg"
-                                        width="14"
-                                        height="14"
-                                        viewBox="0 0 24 24"
-                                        fill="none"
-                                        stroke="currentColor"
-                                        stroke-width="2"
-                                        stroke-linecap="round"
-                                        stroke-linejoin="round"
-                                        style="margin-right: 6px; vertical-align: middle"
-                                    >
-                                        <path d="M21 12a9 9 0 1 1-9-9"></path>
-                                        <path d="M21 3v9h-9"></path>
-                                    </svg>
-                                    <span>
-                                        {{ t("checkUpdate") }}
-                                        <EnvVarTooltip env-var="CHECK_UPDATE" doc-section="app-config" />
-                                    </span>
-                                </span>
-                                <el-switch
-                                    v-model="state.checkUpdateEnabled"
-                                    :width="50"
-                                    :before-change="handleCheckUpdateBeforeChange"
                                 />
                             </div>
                             <div class="switch-container">
@@ -2823,6 +2126,12 @@
                 </div>
             </div>
         </main>
+        <el-dialog v-model="modelDialog.visible" :title="state.currentLang === 'zh' ? `账号 #${modelDialog.index} 的模型目录` : `Models for account #${modelDialog.index}`" width="min(720px, 94vw)" class="model-catalog-dialog">
+            <div class="model-catalog-summary">{{ state.currentLang === 'zh' ? `共 ${modelDialog.models.length} 个目录项` : `${modelDialog.models.length} catalog entries` }}<small>{{ state.currentLang === 'zh' ? '目录不代表已逐项验证可生成' : 'Catalog entries are not individually verified for generation' }}</small></div>
+            <el-input v-model="modelDialog.query" clearable :placeholder="state.currentLang === 'zh' ? '搜索模型名称或 ID' : 'Search name or ID'" />
+            <div class="model-catalog-list"><div v-for="model in filteredDialogModels" :key="model.id" class="model-catalog-row"><span class="model-catalog-name">{{ model.name || model.id }}</span><code>{{ model.id }}</code><span v-if="model.methods?.length" class="model-catalog-methods">{{ model.methods.join(' · ') }}</span></div><div v-if="!filteredDialogModels.length" class="model-catalog-empty">{{ state.currentLang === 'zh' ? '没有匹配的模型' : 'No matching models' }}</div></div>
+            <template #footer><el-button @click="modelDialog.visible = false">{{ state.currentLang === 'zh' ? '关闭' : 'Close' }}</el-button></template>
+        </el-dialog>
 
         <!-- Mobile Floating Action Buttons -->
         <el-affix
@@ -3786,6 +3095,7 @@ const { theme, setTheme } = useTheme();
 
 const state = reactive({
     accountDetails: [],
+    benefitScan: { running: false, total: 0, completed: 0, currentIndex: null, error: null },
     accountLoadBalancerAccounts: [],
     accountLoadBalancerActiveRequests: 0,
     accountLoadBalancerLimit: 0,
@@ -4128,6 +3438,82 @@ const apiKeySourceText = computed(() => {
     const translated = key ? t(key) : "";
     return translated === key ? state.apiKeySource : translated || state.apiKeySource;
 });
+
+const poolSettings = reactive({ paidActive: 3, paidStandby: 2, normalActive: 2, normalStandby: 3 });
+const poolSaving = ref(false);
+let poolSettingsLoaded = false;
+const savePoolSettings = async () => {
+    poolSaving.value = true;
+    try {
+        const r = await fetch("/api/settings/account-pools", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(poolSettings) });
+        const data = await r.json(); if (!r.ok) throw new Error(data.error || "Save failed");
+        Object.assign(poolSettings, data.settings); ElMessage.success(state.currentLang === "zh" ? "设置已保存，账号池正在调整" : "Settings saved; pool is adjusting");
+    } catch (e) { ElMessage.error(e.message); } finally { poolSaving.value = false; }
+};
+
+const accountBenefitGroups = computed(() => {
+    const accounts = state.accountDetails || [];
+    const zh = state.currentLang === "zh";
+    return [
+        { key: "paid", label: zh ? "付费权益（可能为 Pro）" : "Paid benefit (may include Pro)", items: accounts.filter(a => a.benefitState === "ready-paid") },
+        { key: "free", label: zh ? "普通" : "Standard", items: accounts.filter(a => a.benefitState !== "ready-paid") },
+    ];
+});
+
+const benefitProgressPercent = computed(() => state.benefitScan.total ? Math.min(100, Math.round(state.benefitScan.completed * 100 / state.benefitScan.total)) : 0);
+const modelDialog = reactive({ visible: false, index: null, models: [], query: "" });
+const filteredDialogModels = computed(() => { const q = modelDialog.query.trim().toLowerCase(); return modelDialog.models.filter(m => !q || `${m.id} ${m.name}`.toLowerCase().includes(q)); });
+const showBenefitProgress = ref(false);
+let benefitHideTimer = null;
+watch(() => state.benefitScan.running, running => {
+    if (benefitHideTimer) { clearTimeout(benefitHideTimer); benefitHideTimer = null; }
+    if (running) showBenefitProgress.value = true;
+    else if (showBenefitProgress.value && !state.benefitScan.error) benefitHideTimer = setTimeout(() => { showBenefitProgress.value = false; }, 8000);
+});
+const modelCheckIndex = ref(null);
+const handleAccountMenu = async (command, index) => {
+    if (command === "download") return downloadAccountByIndex(index);
+    if (command === "benefit") {
+        try {
+            const r = await fetch(`/api/accounts/${index}/benefit/check`, { method: "POST" });
+            if (!r.ok) throw new Error("failed");
+            ElMessage.success(state.currentLang === "zh" ? `账号 #${index} 已加入检测队列` : `Account #${index} queued`);
+            await updateContent();
+        } catch { ElMessage.error(state.currentLang === "zh" ? "加入检测队列失败" : "Could not queue check"); }
+        return;
+    }
+    if (command !== "models") return;
+    if (modelCheckIndex.value !== null) return ElMessage.warning(state.currentLang === "zh" ? "已有模型检测正在进行" : "A model check is already running");
+    modelCheckIndex.value = index;
+    const busy = ElMessage({ message: state.currentLang === "zh" ? `正在查询账号 #${index} 的模型目录…` : `Checking models for account #${index}…`, duration: 0 });
+    try {
+        const response = await fetch(`/api/accounts/${index}/models/check`, { method: "POST" });
+        const data = await response.json();
+        if (!response.ok) {
+            if (data.error === "account_not_connected") throw new Error(state.currentLang === "zh" ? "该账号尚未登录，请先切换到该账号后再检测。" : "Account is not connected; switch to it first.");
+            throw new Error(state.currentLang === "zh" ? `查询失败（${data.error || response.status}），请稍后重试。` : `Check failed (${data.error || response.status}).`);
+        }
+        modelDialog.index = index;
+        modelDialog.models = data.models;
+        modelDialog.query = "";
+        modelDialog.visible = true;
+    } catch (error) { if (error !== "confirm" && error !== "cancel" && error !== "close") ElMessage.error(error.message || "Model check failed"); }
+    finally { busy.close(); modelCheckIndex.value = null; }
+};
+
+const benefitChecking = ref(false);
+const checkBenefits = async () => {
+    benefitChecking.value = true;
+    try {
+        const response = await fetch("/api/accounts/benefits/check", { method: "POST" });
+        if (!response.ok) throw new Error("check failed");
+        const data = await response.json();
+        state.benefitScan = data;
+        ElMessage.success(data.started ? (state.currentLang === "zh" ? "已开始后台检测" : "Background check started") : (state.currentLang === "zh" ? "检测正在进行中" : "Scan already running"));
+        await updateContent();
+    } catch { ElMessage.error(state.currentLang === "zh" ? "权益检测失败，请稍后重试" : "Benefit check failed"); }
+    finally { benefitChecking.value = false; }
+};
 
 // App version from build-time injection
 const appVersion = computed(() => {
@@ -4551,6 +3937,8 @@ const updateStatus = data => {
     state.debugModeEnabled = isEnabled(data.status.debugMode);
     state.currentAuthIndex = data.status.currentAuthIndex;
     state.accountDetails = data.status.accountDetails || [];
+    if (!poolSettingsLoaded && data.status.accountPools) { Object.assign(poolSettings, data.status.accountPools); poolSettingsLoaded = true; }
+    state.benefitScan = data.status.benefitScan || { running: false, total: 0, completed: 0, currentIndex: null, error: null };
     state.accountLoadBalancingEnabled = isEnabled(data.status.accountLoadBalancing);
     state.accountMaxConcurrentRequests = data.status.accountMaxConcurrentRequests ?? 1;
     state.accountLoadBalancerActiveRequests = data.status.loadBalancer?.activeRequests || 0;
@@ -5079,22 +4467,6 @@ const downloadCurrentLogs = () => {
     URL.revokeObjectURL(url);
 };
 
-// Check for updates once on page load
-const checkForUpdates = async () => {
-    try {
-        const res = await fetch("/api/version/check");
-        if (res.ok) {
-            const data = await res.json();
-            state.hasUpdate = data.hasUpdate;
-            state.latestVersion = data.latest;
-            state.releaseUrl = data.releaseUrl;
-        }
-    } catch (err) {
-        // Silently fail - version check is not critical
-        console.warn("Failed to check for updates:", err.message);
-    }
-};
-
 // Theme handling is now managed by useTheme composable
 
 onMounted(() => {
@@ -5113,14 +4485,14 @@ onMounted(() => {
     updateContent().finally(scheduleUpdate);
     fetchUsageStats().finally(scheduleUpdate);
 
-    // Check for updates once on initial load
-    checkForUpdates();
+
 
     // Expose copyText function globally for tooltip HTML content
     window.__copyEnvVar = text => copyText(text);
 });
 
 onBeforeUnmount(() => {
+    if (benefitHideTimer) clearTimeout(benefitHideTimer);
     isActive = false;
     if (updateTimer) {
         clearTimeout(updateTimer);
@@ -5262,6 +4634,46 @@ watchEffect(() => {
         transform: translateY(0);
     }
 }
+
+.account-benefit-group { margin-top: 18px; }
+.account-group-title { display: flex; align-items: center; gap: 8px; font-size: 14px; margin: 0 0 8px; }
+.account-group-title span { font-size: 12px; border-radius: 10px; padding: 1px 8px; background: var(--el-fill-color-light); color: var(--el-text-color-secondary); }
+.account-group-title.group-paid { color: #16a34a; }
+.account-group-title.group-free { color: #d97706; }
+.account-group-title.group-unknown, .account-group-hint { color: var(--el-text-color-secondary); }
+.account-group-hint { font-size: 12px; margin: 0 0 8px; }
+.pool-settings-hint { color: var(--el-text-color-secondary); font-size: 12px; line-height: 1.6; }
+.pool-settings-grid { display: grid; grid-template-columns: auto 1fr 1fr; gap: 12px; align-items: center; margin: 15px 0; }
+.pool-settings-grid label { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 13px; }
+@media (max-width: 600px) { .pool-settings-grid { grid-template-columns: 1fr 1fr; } .pool-settings-grid strong { grid-column: 1 / -1; } }
+.model-catalog-summary { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: baseline; font-weight: 600; margin-bottom: 12px; }
+.model-catalog-summary small { color: var(--el-text-color-secondary); font-weight: 400; }
+.model-catalog-list { max-height: min(55vh, 480px); overflow: auto; margin-top: 12px; border: 1px solid var(--el-border-color-light); border-radius: 10px; }
+.model-catalog-row { display: grid; gap: 4px; padding: 10px 14px; border-bottom: 1px solid var(--el-border-color-lighter); }
+.model-catalog-row:last-child { border-bottom: 0; }
+.model-catalog-row code { color: var(--el-color-primary); overflow-wrap: anywhere; }
+.model-catalog-name { font-weight: 600; overflow-wrap: anywhere; }
+.model-catalog-methods, .model-catalog-empty { font-size: 12px; color: var(--el-text-color-secondary); }
+.model-catalog-empty { padding: 20px; text-align: center; }
+.benefit-scan-panel { border: 1px solid var(--el-border-color-lighter); border-radius: 10px; padding: 12px 14px; margin: 12px 0; background: var(--el-fill-color-blank); }
+.benefit-progress { margin-top: 12px; max-width: 620px; }
+.benefit-progress-heading { display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 8px; }
+.benefit-progress-caption { font-size: 12px; color: var(--el-text-color-secondary); margin-top: 6px; }
+.standby-badge { color: #b45309; background: rgba(245,158,11,.13); border-radius: 10px; padding: 2px 8px; font-size: 12px; margin-left: 6px; }
+.benefit-toolbar { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin: 12px 0; }
+.benefit-toolbar small { color: var(--el-text-color-secondary); }
+.benefit-paid, .benefit-free, .benefit-unknown { font-size: 12px; margin-left: 6px; }
+.benefit-paid { color: #16a34a; } .benefit-free { color: #d97706; } .benefit-unknown { color: #888; }
+
+/* Compact dashboard overview */
+.overview-grid { width: 100%; }
+.overview-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(155px, 1fr)); gap: 12px; }
+.overview-metric { display: flex; flex-direction: column; gap: 8px; padding: 12px; border: 1px solid var(--el-border-color-lighter); border-radius: 8px; min-width: 0; }
+.overview-metric .label { color: var(--el-text-color-secondary); font-size: 13px; }
+.overview-metric strong { font-size: 16px; }
+.overview-active { color: #16a34a; }
+.overview-standby { color: #d97706; }
+.version-note { color: var(--el-text-color-secondary); font-size: 12px; margin-top: 10px; }
 
 /* Dashboard Grid */
 .dashboard-grid {

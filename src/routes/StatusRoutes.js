@@ -11,6 +11,8 @@ const archiver = require("archiver");
 const VersionChecker = require("../utils/VersionChecker");
 const LoggingService = require("../utils/LoggingService");
 const UsageStatsService = require("../core/UsageStatsService");
+const BenefitScanner = require("../core/BenefitScanner");
+const AccountRoutingPolicy = require("../core/AccountRoutingPolicy");
 
 /**
  * Status Routes Manager
@@ -23,6 +25,18 @@ class StatusRoutes {
         this.config = serverSystem.config;
         this.distIndexPath = serverSystem.distIndexPath;
         this.versionChecker = new VersionChecker(this.logger);
+        this.benefitScanner = new BenefitScanner(serverSystem);
+        serverSystem.browserManager.benefitScanner = this.benefitScanner;
+        this.accountRoutingPolicy = new AccountRoutingPolicy(this.benefitScanner, serverSystem.config);
+        serverSystem.accountRoutingPolicy = this.accountRoutingPolicy;
+        serverSystem.browserManager.accountRoutingPolicy = this.accountRoutingPolicy;
+        if (serverSystem.requestHandler) serverSystem.requestHandler.accountRoutingPolicy = this.accountRoutingPolicy;
+        serverSystem.config.maxContexts = Object.values(this.accountRoutingPolicy.settings).reduce((a,b) => a+b,0);
+        serverSystem.config.accountMaxConcurrentRequestsTotal = this.accountRoutingPolicy.settings.paidActive + this.accountRoutingPolicy.settings.normalActive;
+        const timer = setTimeout(() => this.benefitScanner.start(), 90000);
+        timer.unref?.();
+        const interval = setInterval(() => this.benefitScanner.start(), 6 * 3600000);
+        interval.unref?.();
         this.allowedSafetyThresholds = new Set([
             "HARM_BLOCK_THRESHOLD_UNSPECIFIED",
             "BLOCK_LOW_AND_ABOVE",
@@ -48,6 +62,48 @@ class StatusRoutes {
      * Setup status and management routes
      */
     setupRoutes(app, isAuthenticated) {
+        app.post("/api/accounts/benefits/check", isAuthenticated, (req, res) => {
+            const started = this.benefitScanner.start(true);
+            return res.status(started ? 202 : 200).json({ started, ...this.benefitScanner.progress });
+        });
+
+        app.post("/api/accounts/:index/benefit/check", isAuthenticated, (req, res) => {
+            const index = Number(req.params.index);
+            if (!Number.isSafeInteger(index) || index < 0 || !this.serverSystem.authSource.availableIndices.includes(index)) return res.status(404).json({ error: "account_not_found" });
+            this.benefitScanner.enqueue(index);
+            return res.status(202).json({ queued: true, index });
+        });
+
+        app.put("/api/settings/account-pools", isAuthenticated, async (req, res) => {
+            try {
+                this.accountRoutingPolicy.update(req.body);
+                const settings = this.accountRoutingPolicy.settings;
+                this.serverSystem.config.maxContexts = Object.values(settings).reduce((a,b) => a+b,0);
+                this.serverSystem.config.accountMaxConcurrentRequestsTotal = settings.paidActive + settings.normalActive;
+                this.serverSystem.requestHandler.accountLoadBalancer.maxConcurrentRequests = settings.paidActive + settings.normalActive;
+                this.serverSystem.browserManager.rebalanceContextPool().catch(e => this.logger.warn(`[AccountPool] Rebalance failed: ${e.message}`));
+                this.serverSystem.requestHandler.accountLoadBalancer.notifyAvailabilityChanged();
+                return res.json({ settings });
+            } catch (error) { return res.status(400).json({ error: error.message }); }
+        });
+
+        // ListModels is an account-specific catalog, not proof of successful generation.
+        app.post("/api/accounts/:index/models/check", isAuthenticated, async (req, res) => {
+            const index = Number(req.params.index);
+            if (!Number.isSafeInteger(index) || index < 0 || !this.serverSystem.authSource.availableIndices.includes(index)) return res.status(404).json({ error: "account_not_found" });
+            const manager = this.serverSystem.browserManager;
+            const page = manager.contexts.get(index)?.page;
+            if (!page || page.isClosed() || !page.buildBenefit) return res.status(409).json({ error: "account_not_connected" });
+            if (this.modelCheckRunning) return res.status(409).json({ error: "model_check_in_progress" });
+            this.modelCheckRunning = true;
+            try {
+                const models = await this.serverSystem.dynamicModelCatalog.fetchForAccount(index);
+                const formatted = models.map(m => ({ id: m.name, name: m.displayName, methods: m.supportedGenerationMethods }));
+                return res.json({ index, models: formatted, count: formatted.length, source: "account_catalog", verifiedGeneration: false });
+            } catch { return res.status(502).json({ error: "check_failed" }); }
+            finally { this.modelCheckRunning = false; }
+        });
+
         // Favicon endpoint (public, no authentication required)
         app.get("/favicon.ico", (req, res) => {
             const iconUrl = process.env.ICON_URL || "/AIStudio_logo.svg";
@@ -128,6 +184,10 @@ class StatusRoutes {
         app.get("/api/status", isAuthenticated, async (req, res) => {
             // Force a reload of auth sources on each status check for real-time accuracy
             const hasChanges = this.serverSystem.authSource.reloadAuthSources();
+            if (hasChanges) {
+                for (const index of this.serverSystem.authSource.initialIndices)
+                    if (!this.benefitScanner.get(index)) this.benefitScanner.enqueue(index);
+            }
 
             const { authSource, browserManager, requestHandler } = this.serverSystem;
 
@@ -1085,6 +1145,8 @@ class StatusRoutes {
             const isExpired = expiredIndices.includes(index);
 
             const hasContext = browserManager.contexts.has(index);
+            const isReady = hasContext && this.serverSystem.connectionRegistry.getConnectionByAuth(index, false)?.readyState === 1;
+            const isStandby = isReady && !activeIndexSet.has(index) && !browserManager._isAccountUnavailable(index);
 
             const accountIssue = isInvalid
                 ? { code: "INVALID_AUTH_FILE", severity: "error", deletable: true,
@@ -1093,7 +1155,7 @@ class StatusRoutes {
                     ? { code: "AUTH_EXPIRED", severity: "error", deletable: true,
                         message: "认证已失效，需要重新登录或删除文件" }
                     : browserManager.accountHealth?.get(index) || null;
-            return { canonicalIndex, hasContext, index, isActive: activeIndexSet.has(index), isDuplicate, isExpired, isInvalid, isRotation, name, accountIssue };
+            return { benefitState: this.benefitScanner.get(index)?.state || "unknown", canonicalIndex, hasContext, isReady, isStandby, index, isActive: activeIndexSet.has(index), isDuplicate, isExpired, isInvalid, isRotation, name, accountIssue };
         });
 
         const currentAuthIndex = requestHandler.currentAuthIndex;
@@ -1114,6 +1176,8 @@ class StatusRoutes {
             logs: displayLogs.join("\n"),
             status: {
                 accountDetails,
+                accountPools: this.accountRoutingPolicy.settings,
+                benefitScan: { ...this.benefitScanner.progress },
                 accountLoadBalancing: config.accountLoadBalancing,
                 accountMaxConcurrentRequests: config.accountMaxConcurrentRequests,
                 accountMaxConcurrentRequestsTotal: config.accountMaxConcurrentRequestsTotal,

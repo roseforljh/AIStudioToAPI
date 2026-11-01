@@ -1,3 +1,4 @@
+const DynamicModelCatalog = require("./DynamicModelCatalog");
 /**
  * File: src/core/ProxyServerSystem.js
  * Description: Main proxy server system that orchestrates all components including HTTP/WebSocket servers, authentication, and request handling
@@ -121,6 +122,7 @@ class ProxyServerSystem extends EventEmitter {
 
         this.httpServer = null;
         this.wsServer = null;
+        this.dynamicModelCatalog = new DynamicModelCatalog(this);
         this.webRoutes = new WebRoutes(this);
     }
 
@@ -518,25 +520,20 @@ class ProxyServerSystem extends EventEmitter {
         app.use(this._createAuthMiddleware());
 
         // API routes
-        app.get(["/v1/models"], (req, res) => {
-            // OpenAI format
-            const models = this.config.modelList.map(model => ({
+        app.get(["/v1/models"], async (req, res) => {
+            const catalog = await this.dynamicModelCatalog.list();
+            const models = catalog.map(model => ({
                 context_window: model.inputTokenLimit,
                 created: Math.floor(Date.now() / 1000),
-                id: model.name.replace("models/", ""),
+                id: model.name.replace(/^models\//, ""),
                 max_tokens: model.outputTokenLimit,
-                object: "model",
-                owned_by: "google",
+                object: "model", owned_by: "google",
             }));
-
-            res.status(200).json({
-                data: models,
-                object: "list",
-            });
+            res.status(200).json({ data: models, object: "list" });
         });
 
-        app.get(["/v1beta/models"], (req, res) => {
-            res.status(200).json({ models: this.config.modelList });
+        app.get(["/v1beta/models"], async (req, res) => {
+            res.status(200).json({ models: await this.dynamicModelCatalog.list() });
         });
 
         app.post("/v1/chat/completions", async (req, res) => {
