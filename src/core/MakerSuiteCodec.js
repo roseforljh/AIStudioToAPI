@@ -351,7 +351,12 @@ function merge(chunks) {
     // An empty completion is not a successful answer: the client would receive neither
     // text nor a tool call. Surface it so the request can switch accounts instead of
     // reporting a fake success.
-    const hasContent = out.candidates.some(candidate =>
+    const hasContent = hasCandidatesContent(out.candidates);
+    if (!hasContent) throw emptyCompletionError(out.candidates);
+    return out;
+}
+function hasCandidatesContent(candidates = []) {
+    return candidates.some(candidate =>
         (candidate.content?.parts || []).some(
             part =>
                 (typeof part.text === "string" && part.text.length > 0) ||
@@ -359,15 +364,28 @@ function merge(chunks) {
                 (typeof part.inlineData?.data === "string" && part.inlineData.data.length > 0)
         )
     );
-    if (!hasContent)
-        fail(
-            `MakerSuite upstream returned an empty completion (finishReason=${out.candidates
-                .map(candidate => candidate.finishReason + (candidate.finishReasonCode != null ? `; code=${candidate.finishReasonCode}` : ""))
-                .join(",")})`,
-            503
-        );
-    return out;
 }
+function emptyCompletionError(candidates = []) {
+    return Object.assign(
+        new Error(
+            `MakerSuite upstream returned an empty completion (finishReason=${candidates
+                .map(
+                    candidate =>
+                        candidate.finishReason +
+                        (candidate.finishReasonCode != null ? `; code=${candidate.finishReasonCode}` : "")
+                )
+                .join(",")})`
+        ),
+        { status: 503 }
+    );
+}
+// Observed envelopes: [chunk, ...] or [[chunk, ...]]. A chunk may contain usage only.
+const isChunk = x =>
+    Array.isArray(x) &&
+    ((Array.isArray(x[0]) && x[0].length > 0 && x[0].every(c => Array.isArray(c?.[0]?.[0]) && c[0][1] === "model")) ||
+        ((x[0] == null || (Array.isArray(x[0]) && x[0].length === 0)) && Array.isArray(x[2])));
+const rpcStatusOf = x =>
+    Array.isArray(x) && Number.isInteger(x[0]) && x[0] !== 0 && typeof x[1] === "string" ? x : null;
 function wrapResponse(text, streamed, toolNames) {
     let root;
     try {
@@ -375,18 +393,12 @@ function wrapResponse(text, streamed, toolNames) {
     } catch {
         return fail("Invalid MakerSuite response JSON", 502);
     }
-    // Observed envelopes: [chunk, ...] or [[chunk, ...]]. A chunk may contain usage only.
-    const isChunk = x =>
-        Array.isArray(x) &&
-        ((Array.isArray(x[0]) &&
-            x[0].length > 0 &&
-            x[0].every(c => Array.isArray(c?.[0]?.[0]) && c[0][1] === "model")) ||
-            ((x[0] == null || (Array.isArray(x[0]) && x[0].length === 0)) && Array.isArray(x[2])));
     const arr = Array.isArray(root) && root.some(isChunk) ? root : root?.[0];
     if (!Array.isArray(arr)) fail("Unrecognized MakerSuite response envelope", 502);
     for (const record of arr) {
-        if (Array.isArray(record) && Number.isInteger(record[0]) && record[0] !== 0 && typeof record[1] === "string") {
-            throw Object.assign(new Error(record[1]), { rpcStatus: record, status: RPC_STATUS[record[0]] || 502 });
+        const rpc = rpcStatusOf(record);
+        if (rpc) {
+            throw Object.assign(new Error(rpc[1]), { rpcStatus: rpc, status: RPC_STATUS[rpc[0]] || 502 });
         }
     }
     const chunks = arr.filter(isChunk).map(m => convChunk(m, toolNames));
@@ -395,7 +407,24 @@ function wrapResponse(text, streamed, toolNames) {
     const tail = arr.length && !isChunk(arr.at(-1)) ? arr.at(-1) : null;
     return JSON.stringify([[...chunks.map(c => [JSON.stringify(c)]), ...(tail ? [tail] : [])]]);
 }
-const RPC_STATUS = { 3: 400, 5: 404, 7: 403, 8: 429, 9: 400, 13: 500, 14: 503, 16: 401 };
+const RPC_STATUS = {
+    1: 499,
+    2: 500,
+    3: 400,
+    4: 504,
+    5: 404,
+    6: 409,
+    7: 403,
+    8: 429,
+    9: 400,
+    10: 409,
+    11: 400,
+    12: 501,
+    13: 500,
+    14: 503,
+    15: 500,
+    16: 401,
+};
 function errorEnvelope(text, status) {
     let value;
     try {
@@ -415,4 +444,17 @@ function errorEnvelope(text, status) {
         status: status >= 400 ? status : 502,
     };
 }
-module.exports = { buildBody, decStruct, encStruct, errorEnvelope, merge, wrapResponse };
+module.exports = {
+    buildBody,
+    convChunk,
+    decStruct,
+    emptyCompletionError,
+    encStruct,
+    errorEnvelope,
+    hasCandidatesContent,
+    isChunk,
+    merge,
+    RPC_STATUS,
+    rpcStatusOf,
+    wrapResponse,
+};

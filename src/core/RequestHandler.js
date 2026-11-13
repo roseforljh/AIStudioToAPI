@@ -47,11 +47,21 @@ class RequestHandler {
         this.accountRequestContext = new AccountRequestContext();
         this.accountLoadBalancer = new AccountLoadBalancer({
             acquireTimeoutMs: config.accountAcquireTimeoutMs,
+            canAcquireAuthIndex: index => {
+                const routing = this.serverSystem.accountRoutingPolicy;
+                if (!routing || !config.accountLoadBalancing) return true;
+                const group = routing.group(index);
+                const active = this.accountLoadBalancer
+                    .getSnapshot()
+                    .accounts.filter(account => routing.group(account.authIndex) === group)
+                    .reduce((sum, account) => sum + account.activeRequests, 0);
+                return active < routing.settings[group + "Active"];
+            },
             // 403 基础冷却 30s（连续 403 会自动升档到 300s 上限）：上游 403 常常只针对某一类
             // 请求/某一时刻，若直接用 300s 会把整池按死，导致连纯文本请求都拿 503。
             cooldownByStatus: { 403: 30000, 429: 60000, 503: 30000 },
 
-            getEligibleAuthIndices: () => {
+            getEligibleAuthIndices: allowed => {
                 if (!config.accountLoadBalancing) return [this.authSwitcher.currentAuthIndex];
                 const ready = [...this.connectionRegistry.getAllConnections().entries()]
                     .filter(([, connection]) => connection?.readyState === 1)
@@ -60,7 +70,12 @@ class RequestHandler {
                 // PATCH(active/standby split): only the ACTIVE half is callable;
                 // the rest stay warm as hot standby.
                 if (this.browserManager && typeof this.browserManager.selectActiveAuthIndices === "function") {
-                    return this.browserManager.selectActiveAuthIndices(ready);
+                    // Filter model refusals before filling active slots, so healthy standby
+                    // accounts can be promoted without bypassing model or group limits.
+                    const eligible = allowed
+                        ? ready.filter(index => (typeof allowed === "function" ? allowed(index) : allowed.has(index)))
+                        : ready;
+                    return this.browserManager.selectActiveAuthIndices(eligible);
                 }
                 return ready;
             },
@@ -90,6 +105,7 @@ class RequestHandler {
         }
 
         this.connectionRegistry.on("connectionAdded", () => this.accountLoadBalancer.notifyAvailabilityChanged());
+        this.connectionRegistry.on("contextReady", () => this.accountLoadBalancer.notifyAvailabilityChanged());
         this.connectionRegistry.on("connectionRemoved", () => this.accountLoadBalancer.notifyAvailabilityChanged());
 
         // PATCH(upload-affinity): Google 的可续传上传会话（Files API）绑定在创建它的
@@ -653,29 +669,16 @@ class RequestHandler {
             return callback();
         }
 
-        const model = this._extractModelFromPath(req.path || "") || (typeof req.body?.model === "string" ? req.body.model.replace(/^models\//, "") : null);
+        const model =
+            this._extractModelFromPath(req.path || "") ||
+            (typeof req.body?.model === "string" ? req.body.model.replace(/^models\//, "") : null);
         const policy = this.serverSystem.accountRoutingPolicy;
-        const ready = [...this.connectionRegistry.getAllConnections().entries()].filter(([, c]) => c?.readyState === 1).map(([i]) => i).filter(i => this.browserManager.contexts.has(i));
-        const active = this.browserManager.selectActiveAuthIndices(ready);
-        const groupOf = index => (policy ? policy.group(index) : "normal");
-        const allowed = model && policy
-            ? new Set(
-                  active.filter(
-                      i => !policy.blocked(i, model) && !policy.groupDenied(groupOf(i), model)
-                  )
-              )
-            : null;
-        if (allowed && !allowed.size) {
-            const onlyGroupRestricted =
-                active.length > 0 &&
-                active.every(i => policy.groupDenied(groupOf(i), model) || policy.blocked(i, model));
-            const message = onlyGroupRestricted && active.every(i => groupOf(i) !== "paid")
-                ? `Model ${model} is currently restricted to paid accounts after an upstream refusal; no paid account is active.`
-                : `No eligible active account is available for model ${model}; check account permissions or pool settings.`;
-            this.logger.warn(`[Routing] ${message}`);
-            this._sendErrorResponse(res, 503, message);
-            return;
-        }
+        // Re-evaluate after connection/cooldown changes and retries; a startup
+        // snapshot excludes newly ready or promoted accounts for the whole request.
+        const allowed =
+            model && policy
+                ? index => !policy.blocked(index, model) && !policy.groupDenied(policy.group(index), model)
+                : null;
         const affinityPin = this._getRequestAffinityPin(req);
 
         const controller = new AbortController();
@@ -691,8 +694,8 @@ class RequestHandler {
             lease = await this.accountLoadBalancer.acquire({
                 allowed,
                 noCoolingFallback: Boolean(model),
-                rank: model && policy ? index => policy.rank(index, model) : null,
                 preferredAuthIndex: affinityPin ? affinityPin.authIndex : null,
+                rank: model && policy ? index => policy.rank(index, model) : null,
                 requirePreferred: Boolean(affinityPin),
                 signal: controller.signal,
                 timeoutMs: acquireTimeoutMs,
@@ -718,8 +721,20 @@ class RequestHandler {
                     (affinityPin ? ` (affinity: ${affinityPin.source} -> account #${affinityPin.authIndex})` : "")
             );
             const recordResult = () => {
-                if (model && policy && res.statusCode >= 200 && res.statusCode < 300 && !res.__usageTrackingClientAborted && res.__usageTrackingOutcome !== "error" && !res.__usageTrackingErrorStatus) {
-                    try { policy.noteSuccess(lease.authIndex, model); } catch (e) { this.logger.warn(`[Routing] Could not save success evidence: ${e.name}`); }
+                if (
+                    model &&
+                    policy &&
+                    res.statusCode >= 200 &&
+                    res.statusCode < 300 &&
+                    !res.__usageTrackingClientAborted &&
+                    res.__usageTrackingOutcome !== "error" &&
+                    !res.__usageTrackingErrorStatus
+                ) {
+                    try {
+                        policy.noteSuccess(lease.authIndex, model);
+                    } catch (e) {
+                        this.logger.warn(`[Routing] Could not save success evidence: ${e.name}`);
+                    }
                 }
             };
             res.once("finish", recordResult);
@@ -761,7 +776,11 @@ class RequestHandler {
         const sourceAuthIndex = lease.authIndex;
         const model = this.accountRequestContext.getStore?.()?.model;
         const message = String(errorDetails?.message || "");
-        if (model && /(?:requires|only available|only supported|subscription|pro or ultra|paid tier|upgrade)/i.test(message) && /(?:model|subscription|tier|pro|ultra|upgrade)/i.test(message)) {
+        if (
+            model &&
+            /(?:requires|only available|only supported|subscription|pro or ultra|paid tier|upgrade)/i.test(message) &&
+            /(?:model|subscription|tier|pro|ultra|upgrade)/i.test(message)
+        ) {
             this.serverSystem.accountRoutingPolicy?.markUnsupported(sourceAuthIndex, model);
         }
         attemptedAuthIndices.add(sourceAuthIndex);
@@ -1194,7 +1213,10 @@ class RequestHandler {
     _getRequestAttemptLimit() {
         const configured = Math.max(1, Number(this.config?.maxRetries) || 1);
         if (!this.config?.accountLoadBalancing) return configured;
-        const eligibleAccounts = this.accountLoadBalancer?.getEligibleAuthIndices?.().length ?? this.accountLoadBalancer?.getSnapshot?.()?.accounts?.length ?? 0;
+        const eligibleAccounts =
+            this.accountLoadBalancer?.getEligibleAuthIndices?.().length ??
+            this.accountLoadBalancer?.getSnapshot?.()?.accounts?.length ??
+            0;
         return Math.min(30, Math.max(configured, eligibleAccounts));
     }
 
@@ -1225,7 +1247,9 @@ class RequestHandler {
         return (
             Number(errorDetails?.status) === 400 &&
             /Http response at 400 or 500 level|upstream request failed/i.test(message) &&
-            !/Invalid JSON payload|Unknown name|is not supported for|schema|required field|must be one of/i.test(message)
+            !/Invalid JSON payload|Unknown name|is not supported for|schema|required field|must be one of/i.test(
+                message
+            )
         );
     }
 
@@ -1262,7 +1286,14 @@ class RequestHandler {
     async _handleRequestFailure(errorDetails, sendErrorCallback = null) {
         const requestStore = this.accountRequestContext.getStore();
         const errorMessage = String(errorDetails?.message || "");
-        if (requestStore?.model && requestStore?.lease && /(?:requires|only available|only supported|subscription|pro or ultra|paid tier|upgrade)/i.test(errorMessage) && /(?:model|subscription|tier|pro|ultra|upgrade)/i.test(errorMessage)) {
+        if (
+            requestStore?.model &&
+            requestStore?.lease &&
+            /(?:requires|only available|only supported|subscription|pro or ultra|paid tier|upgrade)/i.test(
+                errorMessage
+            ) &&
+            /(?:model|subscription|tier|pro|ultra|upgrade)/i.test(errorMessage)
+        ) {
             this.serverSystem.accountRoutingPolicy?.markUnsupported(requestStore.lease.authIndex, requestStore.model);
         }
 
@@ -1348,7 +1379,9 @@ class RequestHandler {
         }
         tracker.transient400Retries = count + 1;
         const delayMs = [400, 900][count];
-        this.logger.warn(`[Retry400] Request #${requestId}: real-stream retry ${count + 1}/2 in ${delayMs}ms on the same account.`);
+        this.logger.warn(
+            `[Retry400] Request #${requestId}: real-stream retry ${count + 1}/2 in ${delayMs}ms on the same account.`
+        );
         await new Promise(resolve => setTimeout(resolve, delayMs));
         return true;
     }
@@ -1872,7 +1905,10 @@ class RequestHandler {
                 return this._sendErrorResponse(res, 400, "Invalid OpenAI request format.", "invalid_request_error");
             }
 
-            const effectiveStreamMode = TransportPolicy.resolve(model, modelStreamingMode || systemStreamMode).effectiveMode;
+            const effectiveStreamMode = TransportPolicy.resolve(
+                model,
+                modelStreamingMode || systemStreamMode
+            ).effectiveMode;
             const useRealStream = isOpenAIStream && effectiveStreamMode === "real";
             const googleEndpoint = useRealStream ? "streamGenerateContent" : "generateContent";
             const proxyRequest = {
@@ -1926,7 +1962,7 @@ class RequestHandler {
                             initialMessage.event_type === "error" &&
                             !isUserAbortedError(initialMessage) &&
                             Number.isFinite(initialStatus) &&
-                            this._shouldRetryUpstreamStatus(initialStatus)
+                            this._shouldRetryUpstreamStatus(initialStatus, initialMessage)
                         ) {
                             this.logger.warn(
                                 `[Request] OpenAI real stream received ${initialStatus}, preparing retry...`
@@ -1997,7 +2033,9 @@ class RequestHandler {
                         "Cache-Control": "no-cache",
                         Connection: "keep-alive",
                         "Content-Type": "text/event-stream",
+                        "X-Accel-Buffering": "no",
                     });
+                    res.flushHeaders?.();
                     this.logger.info(`[Request] OpenAI streaming response (Real Mode) started...`);
                     await this._streamOpenAIResponse(currentQueue, res, model, requestId);
                 } else {
@@ -2274,7 +2312,10 @@ class RequestHandler {
                 );
             }
 
-            const effectiveStreamMode = TransportPolicy.resolve(model, modelStreamingMode || systemStreamMode).effectiveMode;
+            const effectiveStreamMode = TransportPolicy.resolve(
+                model,
+                modelStreamingMode || systemStreamMode
+            ).effectiveMode;
             const useRealStream = isOpenAIStream && effectiveStreamMode === "real";
 
             const googleEndpoint = useRealStream ? "streamGenerateContent" : "generateContent";
@@ -2329,7 +2370,7 @@ class RequestHandler {
                             initialMessage.event_type === "error" &&
                             !isUserAbortedError(initialMessage) &&
                             Number.isFinite(initialStatus) &&
-                            this._shouldRetryUpstreamStatus(initialStatus)
+                            this._shouldRetryUpstreamStatus(initialStatus, initialMessage)
                         ) {
                             this.logger.warn(
                                 `[Request] OpenAI Response API real stream received ${initialStatus}, preparing retry...`
@@ -2400,7 +2441,9 @@ class RequestHandler {
                         "Cache-Control": "no-cache",
                         Connection: "keep-alive",
                         "Content-Type": "text/event-stream",
+                        "X-Accel-Buffering": "no",
                     });
+                    res.flushHeaders?.();
                     this.logger.info(`[Request] OpenAI Response API streaming response (Real Mode) started...`);
                     await this._streamOpenAIResponseAPIResponse(currentQueue, res, model, {
                         requestId,
@@ -2646,7 +2689,10 @@ class RequestHandler {
                 return this._sendErrorResponse(res, 400, "Invalid Claude request format.", "invalid_request_error");
             }
 
-            const effectiveStreamMode = TransportPolicy.resolve(model, modelStreamingMode || systemStreamMode).effectiveMode;
+            const effectiveStreamMode = TransportPolicy.resolve(
+                model,
+                modelStreamingMode || systemStreamMode
+            ).effectiveMode;
             const useRealStream = isClaudeStream && effectiveStreamMode === "real";
 
             const googleEndpoint = useRealStream ? "streamGenerateContent" : "generateContent";
@@ -2701,7 +2747,7 @@ class RequestHandler {
                             initialMessage.event_type === "error" &&
                             !isUserAbortedError(initialMessage) &&
                             Number.isFinite(initialStatus) &&
-                            this._shouldRetryUpstreamStatus(initialStatus)
+                            this._shouldRetryUpstreamStatus(initialStatus, initialMessage)
                         ) {
                             this.logger.warn(
                                 `[Request] Claude real stream received ${initialStatus}, preparing retry...`
@@ -2762,7 +2808,9 @@ class RequestHandler {
                         "Cache-Control": "no-cache",
                         Connection: "keep-alive",
                         "Content-Type": "text/event-stream",
+                        "X-Accel-Buffering": "no",
                     });
+                    res.flushHeaders?.();
                     this.logger.info(`[Request] Claude streaming response (Real Mode) started...`);
                     await this._streamClaudeResponse(currentQueue, res, model, requestId);
                 } else {
@@ -3237,6 +3285,7 @@ class RequestHandler {
     async _streamClaudeResponse(messageQueue, res, model, requestId) {
         const streamState = {};
 
+        const stopKeepAlive = this._startStreamKeepAlive(res);
         try {
             // eslint-disable-next-line no-constant-condition
             while (true) {
@@ -3311,6 +3360,8 @@ class RequestHandler {
 
             // Re-throw all other errors to be handled by outer catch block
             throw error;
+        } finally {
+            stopKeepAlive();
         }
     }
 
@@ -3727,7 +3778,10 @@ class RequestHandler {
         if (!res.get("Content-Type")) {
             res.type("text/event-stream");
         }
+        res.set("X-Accel-Buffering", "no");
+        res.flushHeaders?.();
         this.logger.info(`[Request] Gemini streaming response (Real Mode) started...`);
+        const stopKeepAlive = this._startStreamKeepAlive(res);
         try {
             // eslint-disable-next-line no-constant-condition
             while (true) {
@@ -3787,6 +3841,7 @@ class RequestHandler {
                 throw error;
             }
         } finally {
+            stopKeepAlive();
             if (!res.writableEnded) res.end();
             this.logger.debug(
                 `[Request] Real stream response connection closed, request ID: ${proxyRequest.request_id}`
@@ -3946,7 +4001,8 @@ class RequestHandler {
         // requests that legitimately need minutes, so buffered requests use the generation budget.
         const bufferedTransport = proxyRequest.streaming_mode === "fake";
         const totalDeadline = this.config.accountLoadBalancing
-            ? Date.now() + (bufferedTransport
+            ? Date.now() +
+              (bufferedTransport
                   ? Math.max(this._loadBalancerTimeouts().total, this.timeouts.FAKE_STREAM)
                   : this._loadBalancerTimeouts().total)
             : null;
@@ -4109,32 +4165,55 @@ class RequestHandler {
                             // account again for every new request.
                             const routing = this.serverSystem.accountRoutingPolicy;
                             if (routing && routing.group(currentQueueAuthIndex) === "normal") {
-                                const hasPaid = [...this.connectionRegistry.getAllConnections().entries()]
-                                    .some(([idx, c]) => c?.readyState === 1 && routing.group(idx) === "paid");
+                                const hasPaid = [...this.connectionRegistry.getAllConnections().entries()].some(
+                                    ([idx, c]) => c?.readyState === 1 && routing.group(idx) === "paid"
+                                );
                                 if (hasPaid) routing.markGroupDenied("normal", modelName, 600000);
                             }
+                        } catch (e) {
+                            this.logger.warn(`[Routing] Unable to save model cooldown: ${e.name}`);
                         }
-                        catch (e) { this.logger.warn(`[Routing] Unable to save model cooldown: ${e.name}`); }
                     }
-                    if (this._isPinnedRequest(immediateSwitchTracker) || !this.config.accountLoadBalancing || !this.accountRequestContext.getLease()) {
-                        lastError = { ...errorPayload, skipAccountSwitch: true }; break;
+                    if (
+                        this._isPinnedRequest(immediateSwitchTracker) ||
+                        !this.config.accountLoadBalancing ||
+                        !this.accountRequestContext.getLease()
+                    ) {
+                        lastError = { ...errorPayload, skipAccountSwitch: true };
+                        break;
                     }
-                    if (retryAttempt >= requestAttemptLimit) { lastError = { ...errorPayload, skipAccountSwitch: true }; break; }
+                    if (retryAttempt >= requestAttemptLimit) {
+                        lastError = { ...errorPayload, skipAccountSwitch: true };
+                        break;
+                    }
                     try {
-                        const moved = await this._moveCurrentAccountLease(errorPayload, immediateSwitchTracker.attemptedAuthIndices);
+                        const moved = await this._moveCurrentAccountLease(
+                            errorPayload,
+                            immediateSwitchTracker.attemptedAuthIndices
+                        );
                         const nextIndex = this.accountRequestContext.getLease()?.authIndex;
                         if (!moved || !Number.isInteger(nextIndex) || nextIndex === currentQueueAuthIndex) {
-                            lastError = { ...errorPayload, skipAccountSwitch: true }; break;
+                            lastError = { ...errorPayload, skipAccountSwitch: true };
+                            break;
                         }
-                        try { currentQueue.close("retry_account_403"); } catch {}
+                        try {
+                            currentQueue.close("retry_account_403");
+                        } catch {
+                            /* Queue already closed by disconnect. */
+                        }
                         this._advanceProxyRequestAttempt(proxyRequest);
-                        currentQueue = this.connectionRegistry.createMessageQueue(proxyRequest.request_id, nextIndex, proxyRequest.request_attempt_id);
+                        currentQueue = this.connectionRegistry.createMessageQueue(
+                            proxyRequest.request_id,
+                            nextIndex,
+                            proxyRequest.request_attempt_id
+                        );
                         currentQueueAuthIndex = nextIndex;
                         retryAttempt++;
                         continue;
                     } catch (switchError) {
                         this.logger.warn(`[Routing] No alternate account for 403: ${switchError.name}`);
-                        lastError = { ...errorPayload, skipAccountSwitch: true }; break;
+                        lastError = { ...errorPayload, skipAccountSwitch: true };
+                        break;
                     }
                 }
 
@@ -4150,8 +4229,11 @@ class RequestHandler {
                         );
                     if (opaqueUpstream) {
                         const count = Number(immediateSwitchTracker.transient400Retries) || 0;
-                        if (count < 2 && retryAttempt < requestAttemptLimit &&
-                            (totalDeadline === null || Date.now() < totalDeadline)) {
+                        if (
+                            count < 2 &&
+                            retryAttempt < requestAttemptLimit &&
+                            (totalDeadline === null || Date.now() < totalDeadline)
+                        ) {
                             immediateSwitchTracker.transient400Retries = count + 1;
                             const delayMs = [400, 900][count];
                             this.logger.warn(
@@ -4172,10 +4254,12 @@ class RequestHandler {
                             retryAttempt++;
                             continue;
                         }
-                        if (!this._isPinnedRequest(immediateSwitchTracker) &&
+                        if (
+                            !this._isPinnedRequest(immediateSwitchTracker) &&
                             this.config.accountLoadBalancing &&
                             this.accountRequestContext.getLease() &&
-                            !immediateSwitchTracker.transient400Switched) {
+                            !immediateSwitchTracker.transient400Switched
+                        ) {
                             immediateSwitchTracker.transient400Switched = true;
                             try {
                                 const moved = await this._moveCurrentAccountLease(
@@ -4403,6 +4487,7 @@ class RequestHandler {
         if (res.__responseApiSeq == null) res.__responseApiSeq = 0;
         streamState.sequenceNumber = res.__responseApiSeq;
 
+        const stopKeepAlive = this._startStreamKeepAlive(res);
         try {
             // eslint-disable-next-line no-constant-condition
             while (true) {
@@ -4478,12 +4563,15 @@ class RequestHandler {
             }
 
             throw error;
+        } finally {
+            stopKeepAlive();
         }
     }
 
     async _streamOpenAIResponse(messageQueue, res, model, requestId) {
         const streamState = {};
 
+        const stopKeepAlive = this._startStreamKeepAlive(res);
         try {
             // eslint-disable-next-line no-constant-condition
             while (true) {
@@ -4557,6 +4645,8 @@ class RequestHandler {
 
             // Re-throw all other errors to be handled by outer catch block
             throw error;
+        } finally {
+            stopKeepAlive();
         }
     }
 
@@ -4945,6 +5035,27 @@ class RequestHandler {
         }
     }
 
+    _startStreamKeepAlive(res) {
+        const timer = setInterval(() => {
+            if (res.headersSent && this._isResponseWritable(res)) {
+                try {
+                    res.write(": keep-alive\n\n");
+                } catch {
+                    /* disconnect handled by response close */
+                }
+            }
+        }, 10000);
+        timer.unref?.();
+        const stop = () => clearInterval(timer);
+        res.once("close", stop);
+        res.once("finish", stop);
+        return () => {
+            stop();
+            res.removeListener("close", stop);
+            res.removeListener("finish", stop);
+        };
+    }
+
     _setupClientDisconnectHandler(res, requestId) {
         res.on("close", () => {
             if (!res.writableEnded) {
@@ -4966,6 +5077,10 @@ class RequestHandler {
 
     _cancelBrowserRequest(requestId, authIndex, requestAttemptId = null) {
         const targetAuthIndex = authIndex !== undefined ? authIndex : this.currentAuthIndex;
+        const bridge = this.browserManager?.contexts?.get(targetAuthIndex)?.page?.makerSuiteBridge;
+        if (bridge && typeof bridge.cancelAttempt === "function") {
+            bridge.cancelAttempt(requestId, requestAttemptId);
+        }
         const connection = this.connectionRegistry.getConnectionByAuth(targetAuthIndex);
         if (connection) {
             this.logger.info(
@@ -4979,7 +5094,7 @@ class RequestHandler {
                     request_id: requestId,
                 })
             );
-        } else {
+        } else if (!bridge) {
             this.logger.warn(
                 `[Request] Unable to send cancel instruction: No available WebSocket connection for account #${targetAuthIndex}.`
             );
@@ -5259,7 +5374,8 @@ class RequestHandler {
             request_id: requestId,
             response_transform: responseTransform,
             streaming_mode: modelPathMatch
-                ? TransportPolicy.resolve(modelPathMatch[2], modelStreamingMode || this.config.streamingMode).effectiveMode
+                ? TransportPolicy.resolve(modelPathMatch[2], modelStreamingMode || this.config.streamingMode)
+                      .effectiveMode
                 : modelStreamingMode || this.config.streamingMode,
         };
     }
@@ -5282,9 +5398,42 @@ class RequestHandler {
         );
     }
 
+    _getMakerSuiteStreamBridge(proxyRequest, authIndex) {
+        if (!proxyRequest?.is_generative || proxyRequest.streaming_mode !== "real") return null;
+        const model = this._extractModelFromPath(proxyRequest.path);
+        const policy = model ? TransportPolicy.resolve(model, "real") : null;
+        if (policy?.transport !== "makersuite") return null;
+        const bridge = this.browserManager?.contexts?.get(authIndex)?.page?.makerSuiteBridge;
+        return bridge && !bridge.closed && typeof bridge.dispatchStream === "function" ? bridge : null;
+    }
+
     _forwardRequest(proxyRequest, authIndex = this.currentAuthIndex) {
         // PATCH(file-inline): 所有转发路径（含流式直转与重试）都在这里统一内联已上传文件。
         this._applyFileReferenceInlining(proxyRequest);
+        const streamBridge = this._getMakerSuiteStreamBridge(proxyRequest, authIndex);
+        if (streamBridge) {
+            const connection = this.connectionRegistry.getConnectionByAuth(authIndex);
+            if (!connection) throw new Error(`No native connection for account #${authIndex}`);
+            const requestId = proxyRequest.request_id;
+            const attemptId = proxyRequest.request_attempt_id;
+            const entry = this.connectionRegistry.messageQueues.get(requestId);
+            if (!entry || entry.authIndex !== authIndex || entry.requestAttemptId !== attemptId)
+                throw new Error("MakerSuite stream queue ownership mismatch");
+            const source = {};
+            entry.bridgeStreamSource = source;
+            streamBridge.dispatchStream(
+                proxyRequest,
+                event => {
+                    this.connectionRegistry._handleIncomingMessage(
+                        JSON.stringify({ ...event, request_attempt_id: attemptId, request_id: requestId }),
+                        authIndex,
+                        source
+                    );
+                },
+                connection
+            );
+            return;
+        }
         const connection = this.connectionRegistry.getConnectionByAuth(authIndex);
         if (connection) {
             if (process.env.FILE_INLINE_DEBUG === "1" && /generateContent/i.test(String(proxyRequest.path || ""))) {

@@ -6,7 +6,15 @@
 const { BRIDGE_SETTLEMENT_MS, DEFAULT_MAKERSUITE_TIMEOUT_MS } = require("../config/TransportConfig");
 const { randomUUID } = require("node:crypto");
 const { tagStatus } = require("../utils/MakerSuiteAuth");
-const { buildBody, errorEnvelope, wrapResponse } = require("./MakerSuiteCodec");
+const {
+    buildBody,
+    emptyCompletionError,
+    errorEnvelope,
+    hasCandidatesContent,
+    merge,
+    wrapResponse,
+} = require("./MakerSuiteCodec");
+const PlaygroundStreamDecoder = require("./PlaygroundStreamDecoder");
 const RPC = url =>
     url.origin === "https://alkalimakersuite-pa.clients6.google.com" &&
     /^\/\$rpc\/google\.internal\.alkali\.applications\.makersuite\.v1\.MakerSuiteService\/Proxy(?:Unary|Streamed)Call$/.test(
@@ -23,6 +31,7 @@ function installPageBridge() {
     if (window.top && window !== window.top) return;
     if (window.__makerSuiteBridge) return;
     const records = new Map();
+    const streams = new Map();
     const nativeFetch = window.fetch.bind(window);
     const upstreamFetch = (window.__buildBenefit?.nativeFetch || nativeFetch).bind(window);
     const endpoint = "https://alkalimakersuite-pa.clients6.google.com";
@@ -102,7 +111,9 @@ function installPageBridge() {
             if (service.proofWrapper && service.module?.[service.proofKey] === service.proofWrapper)
                 service.module[service.proofKey] = service.proofOriginal;
             for (const r of records.values()) r.controller.abort();
+            for (const id of [...streams.keys()]) service.release(id);
             records.clear();
+            streams.clear();
             observed.clear();
             rejected.clear();
             excluded.clear();
@@ -156,6 +167,24 @@ function installPageBridge() {
             }
             return service.tb ? "ready" : "token_pending";
         },
+
+        async next(id) {
+            const state = streams.get(id);
+            if (!state || state.closed) return { result: { status: 499, text: '[1,"Stream retired"]' } };
+            if (!state.event) {
+                await new Promise(resolve => {
+                    state.take = resolve;
+                });
+            }
+            const event = state.event;
+            state.event = null;
+            state.take = null;
+            state.release?.();
+            state.release = null;
+            if (event?.result) streams.delete(id);
+            return event;
+        },
+
         // Observations belong to this page realm; they cannot survive navigation.
         observe(url, headers) {
             if (
@@ -171,7 +200,16 @@ function installPageBridge() {
             observed.set(key, true);
             return true;
         },
-        async run({ id, body, ht, timeoutMs, readyTimeoutMs, expectedDocumentId, excludedKeys = [] }) {
+
+        release(id) {
+            const state = streams.get(id);
+            if (!state) return;
+            state.closed = true;
+            state.release?.();
+            state.take?.();
+            streams.delete(id);
+        },
+        async run({ id, body, ht, timeoutMs, readyTimeoutMs, expectedDocumentId, excludedKeys = [], onChunk = null }) {
             if (expectedDocumentId && window.__buildBenefit?.documentId !== expectedDocumentId)
                 return { status: 503, text: '[14,"MakerSuite document changed"]' };
             if (service.closed) return { status: 499, text: '[1,"MakerSuite bridge disposed"]' };
@@ -255,18 +293,46 @@ function installPageBridge() {
                         signal,
                     }
                 );
-                const text = await response.text();
+                let text = "";
+                if (onChunk && response.status === 200 && response.body?.getReader) {
+                    const reader = response.body.getReader();
+                    const decoder = new TextDecoder();
+                    try {
+                        // eslint-disable-next-line no-constant-condition
+                        while (true) {
+                            const { value, done } = await abortable(reader.read());
+                            check();
+                            const block = value
+                                ? decoder.decode(value, { stream: !done })
+                                : done
+                                  ? decoder.decode()
+                                  : "";
+                            for (let offset = 0; offset < block.length; offset += 65536) {
+                                await abortable(onChunk({ text: block.slice(offset, offset + 65536) }));
+                            }
+                            if (done) break;
+                        }
+                    } finally {
+                        await reader.cancel().catch(() => {});
+                        reader.releaseLock();
+                    }
+                } else {
+                    text = await abortable(response.text());
+                }
                 check();
                 // Do not learn from this nativeFetch: it deliberately bypasses observe().
                 let rpcCode;
-                try {
-                    const value = JSON.parse(text);
-                    const records = Array.isArray(value)
-                        ? [value, ...value, ...(Array.isArray(value[0]) ? value[0] : [])]
-                        : [];
-                    if (records.some(v => Array.isArray(v) && v[0] === 16 && typeof v[1] === "string")) rpcCode = 16;
-                } catch {
-                    /* codec validates */
+                if (text) {
+                    try {
+                        const value = JSON.parse(text);
+                        const records = Array.isArray(value)
+                            ? [value, ...value, ...(Array.isArray(value[0]) ? value[0] : [])]
+                            : [];
+                        if (records.some(v => Array.isArray(v) && v[0] === 16 && typeof v[1] === "string"))
+                            rpcCode = 16;
+                    } catch {
+                        /* codec validates */
+                    }
                 }
                 if (response.status === 401 || rpcCode === 16) {
                     rejected.add(auth.key);
@@ -291,6 +357,20 @@ function installPageBridge() {
                 settled();
                 if (records.get(id) === record) records.delete(id);
             }
+        },
+
+        // One pending block per stream. Next pull releases the producer without console markers.
+        start(args) {
+            const state = { closed: false, event: null, release: null, take: null };
+            streams.set(args.id, state);
+            const publish = event =>
+                new Promise(resolve => {
+                    if (state.closed) return resolve();
+                    state.event = event;
+                    state.release = resolve;
+                    state.take?.();
+                });
+            void service.run({ ...args, onChunk: publish }).then(result => publish({ result }));
         },
     };
     window.__makerSuiteBridge = service;
@@ -425,6 +505,10 @@ class MakerSuiteBridge {
         this.onNavigation = frame => {
             if (frame === page.mainFrame()) {
                 this.epoch++;
+                for (const entry of this.attempts.values()) {
+                    clearTimeout(entry.timer);
+                    entry.cancelNative?.();
+                }
                 this.attempts.clear();
                 for (const entry of this.active.values()) {
                     this.cancel(entry.id);
@@ -485,7 +569,7 @@ class MakerSuiteBridge {
             return this;
         }
         this.logger.info(
-            `[MakerSuite] account #${this.authIndex}: GenerateContent bridge installed; streamed RPC responses are buffered`
+            `[MakerSuite] account #${this.authIndex}: GenerateContent bridge installed; incremental streaming enabled`
         );
         return this;
     }
@@ -519,8 +603,12 @@ class MakerSuiteBridge {
         return { ...proxyRequest, body: JSON.stringify({ ...body, [ATTEMPT_FIELD]: id }) };
     }
     cancelAttempt(requestId, attemptId) {
-        for (const [id] of this.attempts)
-            if (id === attemptId || (!attemptId && id.startsWith(requestId + "_attempt_"))) this.attempts.delete(id);
+        for (const [id, entry] of this.attempts)
+            if (id === attemptId || (!attemptId && id.startsWith(requestId + "_attempt_"))) {
+                clearTimeout(entry.timer);
+                entry.cancelNative?.();
+                this.attempts.delete(id);
+            }
         for (const entry of this.active.values())
             if (entry.attemptId === attemptId || (!attemptId && entry.attemptId?.startsWith(requestId + "_attempt_"))) {
                 const task = this.cancel(entry.id);
@@ -542,6 +630,283 @@ class MakerSuiteBridge {
             .catch(() => {
                 this.logger.warn(`[MakerSuite] account #${this.authIndex}: cancellation cleanup bounded`);
             });
+    }
+    release(id) {
+        if (this.closed || this.page.isClosed()) return Promise.resolve();
+        return require("../utils/TimeoutUtils")
+            .withHardTimeout(
+                () => this.page.evaluate(pageEval, `window.__makerSuiteBridge?.release(${JSON.stringify(id)})`),
+                2000
+            )
+            .catch(() => {});
+    }
+    dispatchStream(proxyRequest, onEvent, connection) {
+        const { request_id: requestId, request_attempt_id: attemptId } = proxyRequest;
+        const timeoutMs = this.timeoutMs;
+        const model = proxyRequest.path.match(/\/models\/([^:/]+):/)?.[1];
+        const policy = TransportPolicy.resolve(model, "real", this.policy);
+        const wire = this.prepare(
+            { ...proxyRequest, transport_policy: policy },
+            performance.now() + timeoutMs,
+            timeoutMs
+        );
+        const registration = this.attempts.get(attemptId);
+        registration.streamRequest = { ...proxyRequest };
+        registration.onEvent = onEvent;
+        // Stop the auth-carrier fetch on settlement, not its 300-second SDK timeout.
+        let nativeCancelled = false;
+        registration.cancelNative = () => {
+            if (nativeCancelled) return;
+            nativeCancelled = true;
+            try {
+                connection.send(
+                    JSON.stringify({
+                        event_type: "cancel_request",
+                        request_attempt_id: attemptId,
+                        request_id: requestId,
+                    })
+                );
+            } catch {
+                /* A disconnected socket already stops its native fetch. */
+            }
+        };
+        registration.timer = setTimeout(() => {
+            if (this.attempts.get(attemptId) !== registration) return;
+            this.cancelAttempt(requestId, attemptId);
+            onEvent({ event_type: "error", message: "MakerSuite native dispatch deadline exceeded", status: 504 });
+        }, timeoutMs);
+        try {
+            connection.send(JSON.stringify({ event_type: "proxy_request", ...wire }));
+        } catch (error) {
+            clearTimeout(registration.timer);
+            this.attempts.delete(attemptId);
+            throw Object.assign(new Error("MakerSuite native dispatch failed"), { status: 503 });
+        }
+    }
+
+    async streamRequest(proxyRequest, onEvent) {
+        const epoch = this.epoch;
+        const id = randomUUID();
+        const attemptId = proxyRequest.request_attempt_id;
+        let invalid = false;
+        let deadline;
+        let invalidate;
+        const invalidated = new Promise(resolve => {
+            invalidate = () => {
+                invalid = true;
+                resolve({ cancelled: true });
+            };
+        });
+        this.active.set(id, { attemptId, id, invalidate });
+        let headersSent = false;
+        try {
+            if (this.closed || this.benefit?.disposed || this.benefit?.isCurrent() === false)
+                throw Object.assign(new Error("MakerSuite document unavailable"), { status: 503 });
+            const match = String(proxyRequest.path || "").match(
+                /^\/v1(?:beta|alpha)?\/models\/([^:/]+):(streamGenerateContent|generateContent)$/
+            );
+            if (!match) throw Object.assign(new Error("Unsupported MakerSuite streaming path"), { status: 400 });
+            const model = match[1];
+            if (model === "gemini-4-argon" && this.benefit) await this.benefit.assertReady();
+            if (this.benefit && (this.benefit.disposed || !this.benefit.isCurrent()))
+                throw Object.assign(new Error("Retired MakerSuite document"), { status: 503 });
+            const rawBody =
+                typeof proxyRequest.body_b64 === "string" && proxyRequest.body_b64.length
+                    ? Buffer.from(proxyRequest.body_b64, "base64").toString("utf8")
+                    : proxyRequest.body || "{}";
+            let g;
+            try {
+                g = JSON.parse(rawBody);
+            } catch {
+                throw Object.assign(new Error("Invalid Gemini JSON in MakerSuite generation request"), { status: 400 });
+            }
+            if (Object.hasOwn(g, ATTEMPT_FIELD)) delete g[ATTEMPT_FIELD];
+            const { body, ht, toolNames } = buildBody(model, g);
+            const expectedDocumentId = this.benefit
+                ? await this.benefit._evaluate(() => window.__buildBenefit?.documentId)
+                : null;
+            if (invalid || this.closed || epoch !== this.epoch)
+                throw Object.assign(new Error("MakerSuite document changed"), { status: 503 });
+            const registration = this.attempts.get(attemptId);
+            const timeoutMs = Math.floor(
+                Math.min(this.timeoutMs, registration ? registration.bridgeDeadline - performance.now() : Infinity)
+            );
+            if (timeoutMs <= 0)
+                throw Object.assign(new Error("MakerSuite generation deadline exceeded"), { status: 504 });
+            const excludedKeys = [
+                ...Object.entries(proxyRequest.headers || {})
+                    .filter(([name]) => ["x-goog-api-key", "x-api-key"].includes(name.toLowerCase()))
+                    .map(([, value]) => value),
+                proxyRequest.query_params?.key,
+            ].filter(value => typeof value === "string");
+            const arg = {
+                body,
+                excludedKeys,
+                expectedDocumentId,
+                ht,
+                id,
+                readyTimeoutMs: this.readyTimeoutMs,
+                timeoutMs,
+            };
+            this.logger.debug(
+                `[MakerSuite] account=${this.authIndex} attempt=${attemptId || id} model=${model} transport=makersuite rpc=GenerateContent mode=incremental remaining_ms=${timeoutMs}`
+            );
+            const expired = new Promise(resolve => {
+                deadline = setTimeout(() => {
+                    this.cancel(id);
+                    resolve({ result: { status: 504, text: '[4,"MakerSuite generation deadline exceeded"]' } });
+                }, timeoutMs + 250);
+            });
+            const startResult = await Promise.race([
+                this.page.evaluate(pageEval, `${INSTALL}; window.__makerSuiteBridge.start(${JSON.stringify(arg)})`),
+                invalidated,
+                expired,
+            ]);
+            if (invalid || this.closed || epoch !== this.epoch || startResult?.cancelled) return;
+            const finishes = new Map();
+            const deferredTools = new Map();
+            const terminal = { candidates: [] };
+            let outputStarted = false;
+            const decoder = new PlaygroundStreamDecoder(
+                chunk => {
+                    if (invalid || this.closed || epoch !== this.epoch) return;
+                    if (hasCandidatesContent(chunk.candidates)) outputStarted = true;
+                    const output = structuredClone(chunk);
+                    for (const candidate of output.candidates || []) {
+                        if (candidate.finishReason) {
+                            finishes.set(candidate.index, {
+                                content: { parts: [], role: "model" },
+                                finishReason: candidate.finishReason,
+                                ...(candidate.finishReasonCode != null
+                                    ? { finishReasonCode: candidate.finishReasonCode }
+                                    : {}),
+                                index: candidate.index,
+                            });
+                            delete candidate.finishReason;
+                            delete candidate.finishReasonCode;
+                        }
+                        // Executable calls wait for EOF validation and signature-only
+                        // tail parts; normal text remains incremental throughout.
+                        const parts = candidate.content?.parts || [];
+                        const firstCall = parts.findIndex(part => part.functionCall);
+                        if (deferredTools.has(candidate.index) || firstCall >= 0) {
+                            const pending = deferredTools.get(candidate.index) || [];
+                            const at = deferredTools.has(candidate.index) ? 0 : firstCall;
+                            pending.push(...parts.slice(at));
+                            deferredTools.set(candidate.index, pending);
+                            candidate.content.parts = parts.slice(0, at);
+                        }
+                    }
+                    if (chunk.usageMetadata) {
+                        terminal.usageMetadata = { ...terminal.usageMetadata, ...chunk.usageMetadata };
+                    }
+                    if (chunk.responseId) terminal.responseId = chunk.responseId;
+                    if (
+                        output.candidates?.some(c => c.content?.parts?.length > 0 || c.groundingMetadata) ||
+                        output.promptFeedback
+                    ) {
+                        if (!headersSent) {
+                            onEvent({
+                                event_type: "response_headers",
+                                headers: { "content-type": "text/event-stream", "x-accel-buffering": "no" },
+                                status: 200,
+                            });
+                            headersSent = true;
+                        }
+                        onEvent({
+                            data: `data: ${JSON.stringify(output)}\n\n`,
+                            event_type: "chunk",
+                        });
+                    }
+                },
+                { toolNames }
+            );
+            let result = startResult?.result || null;
+            // eslint-disable-next-line no-constant-condition
+            while (!result) {
+                const event = await Promise.race([
+                    this.page.evaluate(pageEval, `window.__makerSuiteBridge.next(${JSON.stringify(id)})`),
+                    invalidated,
+                    expired,
+                ]);
+                if (invalid || this.closed || epoch !== this.epoch || event?.cancelled) return;
+                if (event?.result) {
+                    result = event.result;
+                    break;
+                }
+                if (!event || typeof event.text !== "string")
+                    throw Object.assign(new Error("Invalid MakerSuite stream event"), { status: 502 });
+                decoder.push(event.text);
+            }
+            if (result.status !== 200) {
+                const normalized = errorEnvelope(result.text, result.status);
+                if (result.authState) normalized.body = tagStatus(normalized.body, "key_unavailable");
+                if (normalized.status === 401) {
+                    const state = await this.diagnoseAuth(invalidated);
+                    if (invalid || this.closed || epoch !== this.epoch) return;
+                    normalized.body = tagStatus(normalized.body, state);
+                }
+                const rpc = JSON.parse(normalized.body);
+                throw Object.assign(new Error(rpc[1] || "MakerSuite upstream request failed"), {
+                    rpcStatus: rpc,
+                    status: normalized.status,
+                });
+            }
+            decoder.finish();
+            if (!outputStarted) throw emptyCompletionError([...finishes.values()]);
+            let tools;
+            if (deferredTools.size) {
+                tools = merge([
+                    {
+                        candidates: [...deferredTools].map(([index, parts]) => ({
+                            ...finishes.get(index),
+                            content: { parts, role: "model" },
+                            index,
+                        })),
+                    },
+                ]);
+                for (const candidate of tools.candidates) {
+                    delete candidate.finishReason;
+                    delete candidate.finishReasonCode;
+                }
+            }
+            if (!headersSent) {
+                onEvent({
+                    event_type: "response_headers",
+                    headers: { "content-type": "text/event-stream", "x-accel-buffering": "no" },
+                    status: 200,
+                });
+                headersSent = true;
+            }
+            if (tools) onEvent({ data: `data: ${JSON.stringify(tools)}\n\n`, event_type: "chunk" });
+            terminal.candidates = [...finishes.values()];
+            onEvent({
+                data: `data: ${JSON.stringify(terminal)}\n\n`,
+                event_type: "chunk",
+            });
+            onEvent({ event_type: "stream_close" });
+            this.logger.debug(`[MakerSuite] account #${this.authIndex}: incremental generation completed`);
+        } catch (error) {
+            this.cancel(id);
+            if (!invalid && !this.closed && epoch === this.epoch) {
+                const status = error.status || 502;
+                let message = error.status ? error.message : "MakerSuite bridge request failed";
+                if (status === 401 && !error.rpcStatus) {
+                    const state = await this.diagnoseAuth(invalidated);
+                    if (invalid || this.closed || epoch !== this.epoch) return;
+                    const tagged = JSON.parse(tagStatus(JSON.stringify([16, message]), state));
+                    message = tagged[1];
+                }
+                this.logger.warn(
+                    `[MakerSuite] account #${this.authIndex}: incremental generation failed status=${status}`
+                );
+                onEvent({ event_type: "error", message, status });
+            }
+        } finally {
+            clearTimeout(deadline);
+            this.active.delete(id);
+            await this.release(id);
+        }
     }
     async handle(route) {
         const request = route.request();
@@ -601,6 +966,28 @@ class MakerSuiteBridge {
         });
         this.active.set(request, { attemptId, id, invalidate });
         const fulfill = result => route.fulfill({ ...result, contentType: "application/json+protobuf; charset=UTF-8" });
+        if (registration?.onEvent) {
+            clearTimeout(registration.timer);
+            try {
+                if (registration.epoch !== epoch || registration.policy.model !== match[1]) {
+                    registration.onEvent({
+                        event_type: "error",
+                        message: "Retired MakerSuite streaming attempt",
+                        status: 503,
+                    });
+                } else {
+                    // The native RPC has now populated the page token service. Only our
+                    // incremental events may reach the request queue, never the old SDK reply.
+                    await this.streamRequest(registration.streamRequest, registration.onEvent);
+                }
+            } finally {
+                registration.cancelNative?.();
+                this.active.delete(request);
+                this.attempts.delete(attemptId);
+                await fulfill({ body: "[]", status: 200 }).catch(() => {});
+            }
+            return;
+        }
         try {
             if (
                 hasBodyAttempt &&
@@ -739,6 +1126,10 @@ class MakerSuiteBridge {
         }
         if (!this.page.isClosed()) this.page.evaluate(pageEval, "window.__makerSuiteBridge?.dispose()").catch(() => {});
         this.closed = true;
+        for (const entry of this.attempts.values()) {
+            clearTimeout(entry.timer);
+            entry.cancelNative?.();
+        }
         this.attempts.clear();
         this.page.removeListener("close", this.onClose);
         this.context.removeListener("close", this.onClose);

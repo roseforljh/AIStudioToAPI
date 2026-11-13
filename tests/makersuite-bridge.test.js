@@ -170,7 +170,7 @@ test("installs before navigation, bridges the full dotted RPC name and leaves no
     const stream = f.route({ streamed: true });
     await f.bridge.handle(stream);
     assert.equal(stream.outcomes[0].status, 200);
-    assert.match(f.logs[0], /buffered/);
+    assert.match(f.logs[0], /incremental streaming enabled/);
 });
 
 test("two accounts and concurrent requests keep page authentication isolated", async t => {
@@ -783,3 +783,95 @@ test("empty completions preserve retryable UNAVAILABLE through Studio's RPC deco
         assert.equal(f.calls.length, 1, "the bridge must not replay a generation itself");
     }
 });
+
+test("native stream dispatch bootstraps authentication without executing a second generation", async t => {
+    const f = fixture(t, 0, { bridge: { timeoutMs: 1000 } });
+    await f.init({ capture: false });
+    let wire;
+    const sent = [];
+    const proxy = {
+        body: JSON.stringify({ contents: [{ parts: [{ text: "hi" }], role: "user" }] }),
+        path: "/v1beta/models/gemini-2.5-flash:streamGenerateContent",
+        request_attempt_id: "native-stream_attempt_1",
+        request_id: "native-stream",
+        streaming_mode: "real",
+    };
+    const events = [];
+    f.bridge.dispatchStream(proxy, e => events.push(e), {
+        send: raw => {
+            const message = JSON.parse(raw);
+            sent.push(message);
+            if (message.event_type === "proxy_request") wire = message;
+        },
+    });
+    assert.equal(f.calls.length, 0);
+    await f.sandbox.default_MakerSuite.Cn({ getMetadata: () => ({ authorization: "private" }), mb: { key: PAGE_KEY } });
+    let streamed = 0;
+    f.bridge.streamRequest = async (req, emit) => {
+        streamed++;
+        assert.equal(req.request_attempt_id, proxy.request_attempt_id);
+        assert.equal(f.sandbox.__makerSuiteBridge.auth().state, "ready");
+        emit({ event_type: "stream_close" });
+    };
+    const route = f.route({ body: JSON.parse(wire.body), path: wire.path });
+    await f.bridge.handle(route);
+    assert.equal(streamed, 1);
+    assert.deepEqual(
+        sent.filter(m => m.event_type === "cancel_request"),
+        [{ event_type: "cancel_request", request_attempt_id: proxy.request_attempt_id, request_id: proxy.request_id }]
+    );
+    assert.equal(events[0].event_type, "stream_close");
+    assert.equal(f.calls.length, 0, "the original RPC is an auth carrier, never a duplicate generation");
+    assert.equal(f.bridge.attempts.size, 0);
+});
+
+test("native streaming dispatch timeout is bounded and cancellation clears its timer", async t => {
+    const f = fixture(t, 0, { bridge: { timeoutMs: 20 } });
+    await f.init();
+    const req = {
+        body: "{}",
+        path: "/v1beta/models/gemini-2.5-flash:streamGenerateContent",
+        request_attempt_id: "pending_attempt_1",
+        request_id: "pending",
+    };
+    const error = await new Promise(resolve => f.bridge.dispatchStream(req, resolve, { send() {} }));
+    assert.equal(error.status, 504);
+    assert.equal(f.bridge.attempts.size, 0);
+    f.bridge.dispatchStream(req, () => assert.fail("cancelled timer fired"), { send() {} });
+    f.bridge.cancelAttempt(req.request_id, req.request_attempt_id);
+    await new Promise(resolve => setTimeout(resolve, 30));
+    assert.equal(f.bridge.attempts.size, 0);
+});
+
+for (const terminal of ["error", "throw", "navigation", "cancel"]) {
+    test(`native auth carrier is cancelled after ${terminal} without touching other attempts`, async t => {
+        const f = fixture(t);
+        await f.init();
+        const messages = [];
+        const req = {
+            body: "{}",
+            path: "/v1beta/models/gemini-2.5-flash:streamGenerateContent",
+            request_attempt_id: "carrier_attempt_2",
+            request_id: "carrier",
+        };
+        f.bridge.dispatchStream(req, () => {}, { send: raw => messages.push(JSON.parse(raw)) });
+        const registration = f.bridge.attempts.get(req.request_attempt_id);
+        if (terminal === "navigation") f.bridge.onNavigation(f.frame);
+        else if (terminal === "cancel") f.bridge.cancelAttempt(req.request_id, req.request_attempt_id);
+        else {
+            f.bridge.streamRequest = async (request, emit) => {
+                if (terminal === "throw") throw new Error("fixture failure");
+                emit({ event_type: "error", status: 503 });
+            };
+            const route = f.route({ body: JSON.parse(messages[0].body), path: req.path });
+            if (terminal === "throw") await assert.rejects(f.bridge.handle(route), /fixture failure/);
+            else await f.bridge.handle(route);
+        }
+        registration.cancelNative();
+        assert.deepEqual(
+            messages.filter(m => m.event_type === "cancel_request"),
+            [{ event_type: "cancel_request", request_attempt_id: req.request_attempt_id, request_id: req.request_id }]
+        );
+        assert.equal(f.bridge.attempts.size, 0);
+    });
+}

@@ -37,11 +37,11 @@ function resolve(model, mode = "fake", overrides = {}) {
     const rules = parsePolicy(overrides);
     const transport = Object.hasOwn(rules, model) ? rules[model] : "makersuite";
     return Object.freeze({
-        effectiveMode: transport === "makersuite" && mode === "real" ? "fake" : mode,
-        incremental: transport === "legacy",
+        effectiveMode: mode,
+        incremental: mode === "real",
         model,
         requestedMode: mode,
-        timeoutCategory: transport === "makersuite" || mode !== "real" ? "buffered" : "incremental",
+        timeoutCategory: mode !== "real" ? "buffered" : "incremental",
         transport,
         version: createHash("sha256").update(JSON.stringify(rules)).digest("hex").slice(0, 12),
     });

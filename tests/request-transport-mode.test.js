@@ -1,51 +1,85 @@
-const assert = require('node:assert/strict');
-const test = require('node:test');
-const RequestHandler = require('../src/core/RequestHandler');
+const assert = require("node:assert/strict");
+const test = require("node:test");
+const RequestHandler = require("../src/core/RequestHandler");
 
 for (const [method, translator] of [
-    ['processOpenAIRequest', 'translateOpenAIToGoogle'],
-    ['processOpenAIResponseRequest', 'translateOpenAIResponseToGoogle'],
-    ['processClaudeRequest', 'translateClaudeToGoogle'],
+    ["processOpenAIRequest", "translateOpenAIToGoogle"],
+    ["processOpenAIResponseRequest", "translateOpenAIResponseToGoogle"],
+    ["processClaudeRequest", "translateClaudeToGoogle"],
 ]) {
-    for (const modelStreamingMode of [null, 'real', 'fake']) {
-        test(`${method}: MakerSuite uses unary upstream while retaining client streaming (${modelStreamingMode})`, async () => {
-            const sentinel = new Error('request captured');
+    for (const [modelStreamingMode, expectedEndpoint, expectedMode] of [
+        [null, "streamGenerateContent", "real"],
+        ["real", "streamGenerateContent", "real"],
+        ["fake", "generateContent", "fake"],
+    ]) {
+        test(`${method}: resolves streaming transport (${modelStreamingMode || "default"})`, async () => {
+            const sentinel = new Error("request captured");
             let captured;
             const handler = {
-                config: { accountLoadBalancing: true, streamingMode: 'real' },
-                logger: { info() {}, error() {}, debug() {} },
-                _generateRequestId: () => 'transport-test',
-                _startTrackedRequest() {}, _setResponseApiFormat() {}, _finalizeTrackedRequest() {},
                 _ensureBrowserBackedRequestReady: async () => true,
-                formatConverter: { [translator]: async () => ({
-                    cleanModelName: 'gemini-4-hydrogen', modelStreamingMode,
-                    googleRequest: { contents: [{ role: 'user', parts: [{ text: 'Hi' }] }] },
-                }) },
-                _initializeProxyRequestAttempt(request) { captured = request; throw sentinel; },
+                _finalizeTrackedRequest() {},
+                _generateRequestId: () => "transport-test",
+                _initializeProxyRequestAttempt(request) {
+                    captured = request;
+                    throw sentinel;
+                },
+                _setResponseApiFormat() {},
+                _startTrackedRequest() {},
+                config: { accountLoadBalancing: true, streamingMode: "real" },
+                formatConverter: {
+                    [translator]: async () => ({
+                        cleanModelName: "gemini-4-hydrogen",
+                        googleRequest: { contents: [{ parts: [{ text: "Hi" }], role: "user" }] },
+                        modelStreamingMode,
+                    }),
+                },
+                logger: { debug() {}, error() {}, info() {} },
             };
             await assert.rejects(
-                RequestHandler.prototype[method].call(handler, { body: { stream: true }, path: '/test' }, {}),
+                RequestHandler.prototype[method].call(handler, { body: { stream: true }, path: "/test" }, {}),
                 error => error === sentinel
             );
-            assert.equal(captured.path, '/v1beta/models/gemini-4-hydrogen:generateContent');
-            assert.equal(captured.streaming_mode, 'fake');
-            assert.deepEqual(captured.query_params, {});
+            assert.equal(captured.path, `/v1beta/models/gemini-4-hydrogen:${expectedEndpoint}`);
+            assert.equal(captured.streaming_mode, expectedMode);
+            assert.deepEqual(captured.query_params, expectedMode === "real" ? { alt: "sse" } : {});
         });
     }
 }
 
-test('native Gemini generation resolves the same buffered transport policy', () => {
-    const handler = {
-        config: { streamingMode: 'real' },
-        logger: { info() {}, debug() {} },
+test("native Gemini generation preserves real streaming unless fake is requested", () => {
+    const createHandler = streamingMode => ({
+        config: { streamingMode },
         formatConverter: {
-            sanitizeGeminiTools() {}, ensureServerSideToolInvocations() {}, ensureThoughtSignature() {},
+            ensureServerSideToolInvocations() {},
+            ensureThoughtSignature() {},
             getDefaultSafetySettings: () => [],
+            sanitizeGeminiTools() {},
         },
-    };
-    const request = RequestHandler.prototype._buildProxyRequest.call(handler, {
-        method: 'POST', path: '/v1beta/models/gemini-4-hydrogen:streamGenerateContent',
-        query: { alt: 'sse' }, headers: {}, body: { contents: [{ role: 'user', parts: [{ text: 'Hi' }] }] },
-    }, 'native-test');
-    assert.equal(request.streaming_mode, 'fake');
+        logger: { debug() {}, info() {} },
+    });
+    const realReq = RequestHandler.prototype._buildProxyRequest.call(
+        createHandler("real"),
+        {
+            body: { contents: [{ parts: [{ text: "Hi" }], role: "user" }] },
+            headers: {},
+            method: "POST",
+            path: "/v1beta/models/gemini-4-hydrogen:streamGenerateContent",
+            query: { alt: "sse" },
+        },
+        "native-real"
+    );
+    assert.equal(realReq.streaming_mode, "real");
+
+    const fakeReq = RequestHandler.prototype._buildProxyRequest.call(
+        createHandler("fake"),
+        {
+            body: { contents: [{ parts: [{ text: "Hi" }], role: "user" }] },
+            headers: {},
+            method: "POST",
+            path: "/v1beta/models/gemini-4-hydrogen:streamGenerateContent",
+            query: { alt: "sse" },
+        },
+        "native-fake"
+    );
+    assert.equal(fakeReq.streaming_mode, "fake");
 });

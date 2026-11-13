@@ -243,7 +243,7 @@ class ConnectionRegistry extends EventEmitter {
         this.emit("connectionRemoved", websocket);
     }
 
-    _handleIncomingMessage(messageData, messageAuthIndex) {
+    _handleIncomingMessage(messageData, messageAuthIndex, bridgeStreamSource = null) {
         try {
             const parsedMessage = JSON.parse(messageData);
             const requestId = parsedMessage.request_id;
@@ -253,6 +253,9 @@ class ConnectionRegistry extends EventEmitter {
             }
             const entry = this.messageQueues.get(requestId);
             if (entry) {
+                // A bridged stream owns its queue. The SDK's intercepted RPC is only
+                // an authentication/cancellation carrier, not a second response source.
+                if (entry.bridgeStreamSource && entry.bridgeStreamSource !== bridgeStreamSource) return;
                 // Verify that the message comes from the correct authIndex
                 if (messageAuthIndex !== entry.authIndex) {
                     this.logger.warn(
