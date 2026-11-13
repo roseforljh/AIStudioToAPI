@@ -189,13 +189,13 @@ test("two accounts and concurrent requests keep page authentication isolated", a
     assert.equal(a.bridge.active.size, 0);
 });
 
-test("unsupported requests fail before network; missing token is bounded and distinct", async t => {
+test("invalid core requests fail before network; missing token is bounded and distinct", async t => {
     const f = fixture(t);
     await f.init({ capture: false });
-    const unsupported = f.route({ body: { contents: [{ parts: [{ text: "hi" }] }], tools: [{ googleSearch: {} }] } });
+    const unsupported = f.route({ body: { contents: [] } });
     await f.bridge.handle(unsupported);
     assert.equal(unsupported.outcomes[0].status, 400);
-    assert.match(unsupported.outcomes[0].body, /does not support tools.googleSearch/);
+    assert.match(unsupported.outcomes[0].body, /Generation requires contents/);
     assert.equal(f.calls.length, 0);
     const unready = f.route();
     await f.bridge.handle(unready);
@@ -765,5 +765,21 @@ test("ambiguous or missing native exports fail without calling unrelated functio
         assert.equal(f.calls.length, 0);
         assert.ok(f.logs.some(line => line.includes("readiness=module_unsupported")));
         assert.doesNotThrow(() => f.sandbox.__makerSuiteBridge.dispose());
+    }
+});
+
+test("empty completions preserve retryable UNAVAILABLE through Studio's RPC decoder", async t => {
+    const empty = JSON.stringify([[[[[[], "model"], 19]], null, [1, 0, 1]]]);
+    for (const streamed of [false, true]) {
+        const f = fixture(t, 0, { fetch: async () => ({ status: 200, text: async () => empty }) });
+        await f.init();
+        const route = f.route({ streamed });
+        await f.bridge.handle(route);
+        const result = route.outcomes[0];
+        assert.equal(result.status, 503);
+        const rpcStatus = JSON.parse(result.body);
+        assert.equal(rpcStatus[0], 14, "Studio decodes INTERNAL (13) as 500, which bypasses the 503 switch policy");
+        assert.match(rpcStatus[1], /empty completion.*code=19/);
+        assert.equal(f.calls.length, 1, "the bridge must not replay a generation itself");
     }
 });

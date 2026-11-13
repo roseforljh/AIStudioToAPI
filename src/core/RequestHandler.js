@@ -11,6 +11,7 @@
  */
 const AuthSwitcher = require("../auth/AuthSwitcher");
 const FormatConverter = require("./FormatConverter");
+const TransportPolicy = require("./ModelTransportPolicy");
 const AccountLoadBalancer = require("./AccountLoadBalancer");
 const AccountRequestContext = require("./AccountRequestContext");
 const UploadSessionAffinity = require("./UploadSessionAffinity");
@@ -656,9 +657,23 @@ class RequestHandler {
         const policy = this.serverSystem.accountRoutingPolicy;
         const ready = [...this.connectionRegistry.getAllConnections().entries()].filter(([, c]) => c?.readyState === 1).map(([i]) => i).filter(i => this.browserManager.contexts.has(i));
         const active = this.browserManager.selectActiveAuthIndices(ready);
-        const allowed = model && policy ? new Set(active.filter(i => !policy.blocked(i, model))) : null;
+        const groupOf = index => (policy ? policy.group(index) : "normal");
+        const allowed = model && policy
+            ? new Set(
+                  active.filter(
+                      i => !policy.blocked(i, model) && !policy.groupDenied(groupOf(i), model)
+                  )
+              )
+            : null;
         if (allowed && !allowed.size) {
-            this._sendErrorResponse(res, 503, `No eligible active account is available for model ${model}; check account permissions or pool settings.`);
+            const onlyGroupRestricted =
+                active.length > 0 &&
+                active.every(i => policy.groupDenied(groupOf(i), model) || policy.blocked(i, model));
+            const message = onlyGroupRestricted && active.every(i => groupOf(i) !== "paid")
+                ? `Model ${model} is currently restricted to paid accounts after an upstream refusal; no paid account is active.`
+                : `No eligible active account is available for model ${model}; check account permissions or pool settings.`;
+            this.logger.warn(`[Routing] ${message}`);
+            this._sendErrorResponse(res, 503, message);
             return;
         }
         const affinityPin = this._getRequestAffinityPin(req);
@@ -1205,8 +1220,21 @@ class RequestHandler {
 
     // Upstream 404s are transient in AI Studio. Retry internally before exposing
     // the error; unlike 403/429/503, a 404 must not cool down or evict an account.
-    _shouldRetryUpstreamStatus(status) {
-        return Number(status) === 404 || Boolean(this.config?.immediateSwitchStatusCodes?.includes(Number(status)));
+    _isOpaqueUpstream400(errorDetails) {
+        const message = String(errorDetails?.message || "");
+        return (
+            Number(errorDetails?.status) === 400 &&
+            /Http response at 400 or 500 level|upstream request failed/i.test(message) &&
+            !/Invalid JSON payload|Unknown name|is not supported for|schema|required field|must be one of/i.test(message)
+        );
+    }
+
+    _shouldRetryUpstreamStatus(status, errorDetails = null) {
+        return (
+            Number(status) === 404 ||
+            this._isOpaqueUpstream400(errorDetails || { status }) ||
+            Boolean(this.config?.immediateSwitchStatusCodes?.includes(Number(status)))
+        );
     }
 
     async _prepareTransient404Retry(errorDetails, requestId, tracker) {
@@ -1311,9 +1339,27 @@ class RequestHandler {
         return true;
     }
 
+    async _prepareTransient400Retry(errorDetails, requestId, tracker) {
+        if (!this._isOpaqueUpstream400(errorDetails) || !tracker) return false;
+        const count = Number(tracker.transient400Retries) || 0;
+        if (count >= 2) {
+            this.logger.warn(`[Retry400] Request #${requestId}: 2 real-stream retries exhausted.`);
+            return false;
+        }
+        tracker.transient400Retries = count + 1;
+        const delayMs = [400, 900][count];
+        this.logger.warn(`[Retry400] Request #${requestId}: real-stream retry ${count + 1}/2 in ${delayMs}ms on the same account.`);
+        await new Promise(resolve => setTimeout(resolve, delayMs));
+        return true;
+    }
+
     async _prepareImmediateStatusRetry(errorDetails, requestId, tracker, sourceAuthIndex) {
         if (Number(errorDetails?.status) === 404) {
             return this._prepareTransient404Retry(errorDetails, requestId, tracker);
+        }
+        if (this._isOpaqueUpstream400(errorDetails)) {
+            const retried = await this._prepareTransient400Retry(errorDetails, requestId, tracker);
+            if (retried) return true;
         }
         const currentAuthIndex = this.currentAuthIndex;
         const hasSourceAuth = Number.isInteger(sourceAuthIndex) && sourceAuthIndex >= 0;
@@ -1826,7 +1872,7 @@ class RequestHandler {
                 return this._sendErrorResponse(res, 400, "Invalid OpenAI request format.", "invalid_request_error");
             }
 
-            const effectiveStreamMode = modelStreamingMode || systemStreamMode;
+            const effectiveStreamMode = TransportPolicy.resolve(model, modelStreamingMode || systemStreamMode).effectiveMode;
             const useRealStream = isOpenAIStream && effectiveStreamMode === "real";
             const googleEndpoint = useRealStream ? "streamGenerateContent" : "generateContent";
             const proxyRequest = {
@@ -2228,7 +2274,7 @@ class RequestHandler {
                 );
             }
 
-            const effectiveStreamMode = modelStreamingMode || systemStreamMode;
+            const effectiveStreamMode = TransportPolicy.resolve(model, modelStreamingMode || systemStreamMode).effectiveMode;
             const useRealStream = isOpenAIStream && effectiveStreamMode === "real";
 
             const googleEndpoint = useRealStream ? "streamGenerateContent" : "generateContent";
@@ -2600,7 +2646,7 @@ class RequestHandler {
                 return this._sendErrorResponse(res, 400, "Invalid Claude request format.", "invalid_request_error");
             }
 
-            const effectiveStreamMode = modelStreamingMode || systemStreamMode;
+            const effectiveStreamMode = TransportPolicy.resolve(model, modelStreamingMode || systemStreamMode).effectiveMode;
             const useRealStream = isClaudeStream && effectiveStreamMode === "real";
 
             const googleEndpoint = useRealStream ? "streamGenerateContent" : "generateContent";
@@ -3197,6 +3243,8 @@ class RequestHandler {
                 const message = await messageQueue.dequeue(this.timeouts.STREAM_CHUNK);
 
                 if (message.type === "STREAM_END") {
+                    const tail = this.formatConverter.translateGoogleToClaudeStream("", model, streamState, true);
+                    if (tail && this._isResponseWritable(res)) res.write(tail);
                     this.logger.info(`✅ [Request] Response completed (Claude real stream), request ID: ${requestId}`);
                     break;
                 }
@@ -3604,7 +3652,7 @@ class RequestHandler {
                 proxyRequest.is_generative &&
                 !isUserAbortedError(headerMessage) &&
                 Number.isFinite(headerStatus) &&
-                this._shouldRetryUpstreamStatus(headerStatus)
+                this._shouldRetryUpstreamStatus(headerStatus, headerMessage)
             ) {
                 this.logger.warn(`[Request] Gemini real stream received ${headerStatus}, preparing retry...`);
                 this._cancelCurrentAttemptBeforeRetry(proxyRequest, currentQueueAuthIndex);
@@ -3893,16 +3941,30 @@ class RequestHandler {
 
         let lastError = null;
         let currentQueue = messageQueue;
-        const totalDeadline = this.config.accountLoadBalancing ? Date.now() + this._loadBalancerTimeouts().total : null;
+        // The MakerSuite transport buffers the whole generation, so the first internal message
+        // arrives only after upstream finishes. A 45s first-response window aborts large-context
+        // requests that legitimately need minutes, so buffered requests use the generation budget.
+        const bufferedTransport = proxyRequest.streaming_mode === "fake";
+        const totalDeadline = this.config.accountLoadBalancing
+            ? Date.now() + (bufferedTransport
+                  ? Math.max(this._loadBalancerTimeouts().total, this.timeouts.FAKE_STREAM)
+                  : this._loadBalancerTimeouts().total)
+            : null;
         const registeredQueueAuthIndex = this.connectionRegistry.getAuthIndexForRequest(proxyRequest.request_id);
         // Track the authIndex registered for the current queue, which may differ from the global current account.
         let currentQueueAuthIndex =
             Number.isInteger(registeredQueueAuthIndex) && registeredQueueAuthIndex >= 0
                 ? registeredQueueAuthIndex
                 : this.currentAuthIndex;
-        const initialResponseTimeout = this.config.accountLoadBalancing
-            ? Math.min(this.timeouts.FAKE_STREAM, this._loadBalancerTimeouts().initial)
-            : this.timeouts.FAKE_STREAM;
+        const initialResponseTimeout = bufferedTransport
+            ? this.timeouts.FAKE_STREAM
+            : this.config.accountLoadBalancing
+              ? Math.min(this.timeouts.FAKE_STREAM, this._loadBalancerTimeouts().initial)
+              : this.timeouts.FAKE_STREAM;
+        if (bufferedTransport)
+            this.logger.debug(
+                `[Request] Buffered transport budget: first-message=${initialResponseTimeout}ms, request total=${this._loadBalancerTimeouts().total}ms`
+            );
         let retryAttempt = 1;
         const immediateSwitchTracker = this._createImmediateSwitchTracker(currentQueueAuthIndex);
 
@@ -4040,7 +4102,18 @@ class RequestHandler {
                 if (errorStatus === 403 && proxyRequest.is_generative && !isUserAbortedError(errorPayload)) {
                     const modelName = this._extractModelFromPath(proxyRequest.path);
                     if (modelName && Number.isInteger(currentQueueAuthIndex)) {
-                        try { this.serverSystem.accountRoutingPolicy?.noteDenied(currentQueueAuthIndex, modelName); }
+                        try {
+                            this.serverSystem.accountRoutingPolicy?.noteDenied(currentQueueAuthIndex, modelName);
+                            // A standard account refused this model while a paid group exists:
+                            // remember the restriction briefly instead of probing every standard
+                            // account again for every new request.
+                            const routing = this.serverSystem.accountRoutingPolicy;
+                            if (routing && routing.group(currentQueueAuthIndex) === "normal") {
+                                const hasPaid = [...this.connectionRegistry.getAllConnections().entries()]
+                                    .some(([idx, c]) => c?.readyState === 1 && routing.group(idx) === "paid");
+                                if (hasPaid) routing.markGroupDenied("normal", modelName, 600000);
+                            }
+                        }
                         catch (e) { this.logger.warn(`[Routing] Unable to save model cooldown: ${e.name}`); }
                     }
                     if (this._isPinnedRequest(immediateSwitchTracker) || !this.config.accountLoadBalancing || !this.accountRequestContext.getLease()) {
@@ -4062,6 +4135,79 @@ class RequestHandler {
                     } catch (switchError) {
                         this.logger.warn(`[Routing] No alternate account for 403: ${switchError.name}`);
                         lastError = { ...errorPayload, skipAccountSwitch: true }; break;
+                    }
+                }
+
+                // Google occasionally answers a valid generative call with an opaque
+                // gateway 400 ("Http response at 400 or 500 level") that succeeds on retry.
+                // Only that opaque shape is retried; explicit validation errors are surfaced.
+                if (errorStatus === 400 && proxyRequest.is_generative && !isUserAbortedError(errorPayload)) {
+                    const rawMessage = String(errorPayload?.message || "");
+                    const opaqueUpstream =
+                        /Http response at 400 or 500 level|upstream request failed/i.test(rawMessage) &&
+                        !/Invalid JSON payload|Unknown name|is not supported for|schema|required field|must be one of/i.test(
+                            rawMessage
+                        );
+                    if (opaqueUpstream) {
+                        const count = Number(immediateSwitchTracker.transient400Retries) || 0;
+                        if (count < 2 && retryAttempt < requestAttemptLimit &&
+                            (totalDeadline === null || Date.now() < totalDeadline)) {
+                            immediateSwitchTracker.transient400Retries = count + 1;
+                            const delayMs = [400, 900][count];
+                            this.logger.warn(
+                                `[Retry400] Request #${proxyRequest.request_id}: opaque upstream 400 on account #${currentQueueAuthIndex}; retrying same account in ${delayMs}ms (${count + 1}/2).`
+                            );
+                            await new Promise(resolve => setTimeout(resolve, delayMs));
+                            this._advanceProxyRequestAttempt(proxyRequest);
+                            try {
+                                currentQueue.close("transient_400_retry");
+                            } catch {
+                                /* already closed */
+                            }
+                            currentQueue = this.connectionRegistry.createMessageQueue(
+                                proxyRequest.request_id,
+                                currentQueueAuthIndex,
+                                proxyRequest.request_attempt_id
+                            );
+                            retryAttempt++;
+                            continue;
+                        }
+                        if (!this._isPinnedRequest(immediateSwitchTracker) &&
+                            this.config.accountLoadBalancing &&
+                            this.accountRequestContext.getLease() &&
+                            !immediateSwitchTracker.transient400Switched) {
+                            immediateSwitchTracker.transient400Switched = true;
+                            try {
+                                const moved = await this._moveCurrentAccountLease(
+                                    errorPayload,
+                                    immediateSwitchTracker.attemptedAuthIndices
+                                );
+                                const nextIndex = this.accountRequestContext.getLease()?.authIndex;
+                                if (moved && Number.isInteger(nextIndex) && nextIndex !== currentQueueAuthIndex) {
+                                    this.logger.warn(
+                                        `[Retry400] Opaque upstream 400 persisted; switching request #${proxyRequest.request_id} to account #${nextIndex}.`
+                                    );
+                                    try {
+                                        currentQueue.close("transient_400_account_switch");
+                                    } catch {
+                                        /* already closed */
+                                    }
+                                    this._advanceProxyRequestAttempt(proxyRequest);
+                                    currentQueue = this.connectionRegistry.createMessageQueue(
+                                        proxyRequest.request_id,
+                                        nextIndex,
+                                        proxyRequest.request_attempt_id
+                                    );
+                                    currentQueueAuthIndex = nextIndex;
+                                    retryAttempt++;
+                                    continue;
+                                }
+                            } catch (switchError) {
+                                this.logger.warn(
+                                    `[Retry400] No alternate account after opaque 400: ${switchError.name}`
+                                );
+                            }
+                        }
                     }
                 }
 
@@ -4262,6 +4408,8 @@ class RequestHandler {
             while (true) {
                 const message = await messageQueue.dequeue(this.timeouts.STREAM_CHUNK);
                 if (message.type === "STREAM_END") {
+                    const tail = this.formatConverter.translateGoogleToResponseAPIStream("", model, streamState, true);
+                    if (tail && this._isResponseWritable(res)) res.write(tail);
                     this.logger.info(
                         `✅ [Request] Response completed (OpenAI Response API real stream), request ID: ${requestId}`
                     );
@@ -4341,6 +4489,8 @@ class RequestHandler {
             while (true) {
                 const message = await messageQueue.dequeue(this.timeouts.STREAM_CHUNK);
                 if (message.type === "STREAM_END") {
+                    const tail = this.formatConverter.translateGoogleToOpenAIStream("", model, streamState, true);
+                    if (tail && this._isResponseWritable(res)) res.write(tail);
                     if (this._isResponseWritable(res)) {
                         try {
                             res.write("data: [DONE]\n\n");
@@ -5108,7 +5258,9 @@ class RequestHandler {
             query_params: req.query || {},
             request_id: requestId,
             response_transform: responseTransform,
-            streaming_mode: modelStreamingMode || this.config.streamingMode,
+            streaming_mode: modelPathMatch
+                ? TransportPolicy.resolve(modelPathMatch[2], modelStreamingMode || this.config.streamingMode).effectiveMode
+                : modelStreamingMode || this.config.streamingMode,
         };
     }
 

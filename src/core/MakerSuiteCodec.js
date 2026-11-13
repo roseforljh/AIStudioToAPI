@@ -4,6 +4,7 @@
  * See docs/zh/makersuite-generate-content-protocol-repair-plan-20261016.md.
  * Positions below are observed protocol fields, not a public Google API contract.
  */
+const { createHash } = require("node:crypto");
 const CAT = {
     HARM_CATEGORY_CIVIC_INTEGRITY: 11,
     HARM_CATEGORY_DANGEROUS_CONTENT: 10,
@@ -18,12 +19,9 @@ const fail = (message, status = 400) => {
     throw Object.assign(new Error(message), { status });
 };
 const fill = a => Array.from(a, v => (v === undefined ? null : v));
-function fields(value, allowed, path) {
+// Encoders below are the upstream whitelist: unknown fields are never serialized.
+function assertObject(value, path) {
     if (!value || typeof value !== "object" || Array.isArray(value)) fail(`Invalid ${path}`);
-    for (const key of Object.keys(value)) {
-        if (value[key] !== undefined && !allowed.includes(key))
-            fail(`MakerSuite bridge does not support ${path}.${key}`);
-    }
 }
 function encVal(v) {
     if (v == null) return [0];
@@ -52,31 +50,99 @@ function decVal(v) {
     return null;
 }
 function decStruct(st) {
-    if (!Array.isArray(st) || !Array.isArray(st[0])) return fail("Invalid MakerSuite Struct", 502);
-    return Object.fromEntries(st[0].map(([k, v]) => [k, decVal(v)]));
+    // Protobuf omits an empty repeated field: [] and [[]] both represent {}.
+    if (!Array.isArray(st)) return fail("Invalid MakerSuite Struct", 502);
+    if (st.length === 0) return {};
+    if (!Array.isArray(st[0])) return fail("Invalid MakerSuite Struct", 502);
+    return Object.fromEntries(
+        st[0].map(entry => {
+            if (!Array.isArray(entry) || typeof entry[0] !== "string" || entry.length !== 2)
+                return fail("Invalid MakerSuite Struct entry", 502);
+            return [entry[0], decVal(entry[1])];
+        })
+    );
 }
 function encSchema(sc) {
-    fields(sc, ["type", "format", "description", "nullable", "enum", "items", "properties", "required"], "schema");
-    const type = TYP[String(sc.type || "object").toLowerCase()];
-    if (!Number.isInteger(type)) fail("Unsupported MakerSuite schema type");
-    const a = [type];
-    if (sc.format) a[1] = sc.format;
-    if (sc.description) a[2] = sc.description;
-    if (sc.nullable != null) a[3] = !!sc.nullable;
-    if (sc.enum) a[4] = sc.enum.map(String);
-    if (sc.items) a[5] = encSchema(sc.items);
-    if (sc.properties) a[6] = Object.entries(sc.properties).map(([k, v]) => [k, encSchema(v)]);
-    if (sc.required) a[7] = sc.required;
+    // Native _.al/_.Vk fields, bundle JLBvzaeCXqM.2018; see the in-repo protocol notes.
+    assertObject(sc, "schema");
+    const a = [];
+    const composed = ["oneOf", "anyOf", "allOf", "not"].some(key => sc[key] !== undefined);
+    if (sc.type !== undefined || !composed) {
+        const type = TYP[String(sc.type || "object").toLowerCase()];
+        if (!Number.isInteger(type)) fail("Unsupported MakerSuite schema type");
+        a[0] = type;
+    }
+    for (const [key, index] of [
+        ["format", 1],
+        ["description", 2],
+        ["pattern", 14],
+    ]) {
+        if (sc[key] === undefined) continue;
+        if (typeof sc[key] !== "string") fail(`Invalid schema.${key}`);
+        a[index] = sc[key];
+    }
+    if (sc.nullable !== undefined) {
+        if (typeof sc.nullable !== "boolean") fail("Invalid schema.nullable");
+        a[3] = sc.nullable;
+    }
+    for (const [key, index] of [
+        ["enum", 4],
+        ["required", 7],
+        ["propertyOrdering", 22],
+    ]) {
+        if (sc[key] === undefined) continue;
+        if (!Array.isArray(sc[key]) || !sc[key].every(v => typeof v === "string")) fail(`Invalid schema.${key}`);
+        a[index] = sc[key];
+    }
+    if (sc.items !== undefined) a[5] = encSchema(sc.items);
+    if (sc.properties !== undefined) {
+        assertObject(sc.properties, "schema.properties");
+        a[6] = Object.entries(sc.properties).map(([k, v]) => [k, encSchema(v)]);
+    }
+    for (const [key, index] of [
+        ["minProperties", 8],
+        ["maxProperties", 9],
+        ["minLength", 12],
+        ["maxLength", 13],
+        ["maxItems", 20],
+        ["minItems", 21],
+    ]) {
+        if (sc[key] === undefined) continue;
+        if (!Number.isSafeInteger(sc[key]) || sc[key] < 0) fail(`Invalid schema.${key}`);
+        a[index] = String(sc[key]); // int64 in protobuf JSON is a decimal string.
+    }
+    for (const [key, index] of [
+        ["minimum", 10],
+        ["maximum", 11],
+    ]) {
+        if (sc[key] === undefined) continue;
+        if (typeof sc[key] !== "number" || !Number.isFinite(sc[key])) fail(`Invalid schema.${key}`);
+        a[index] = sc[key];
+    }
+    if (Object.hasOwn(sc, "example")) a[15] = encVal(sc.example);
+    for (const [key, index] of [
+        ["oneOf", 16],
+        ["anyOf", 17],
+        ["allOf", 18],
+    ]) {
+        if (sc[key] === undefined) continue;
+        if (!Array.isArray(sc[key]) || !sc[key].length) fail(`Invalid schema.${key}`);
+        a[index] = sc[key].map(encSchema);
+    }
+    if (sc.not !== undefined) a[19] = encSchema(sc.not);
     return fill(a);
 }
-function encTools(tools = []) {
+function encTools(tools = [], toolName) {
     const decls = [];
     for (const t of tools) {
-        fields(t, ["functionDeclarations", "function_declarations"], "tools");
+        assertObject(t, "tools");
         for (const d of t.functionDeclarations || t.function_declarations || []) {
-            fields(d, ["name", "description", "parameters", "parametersJsonSchema"], "functionDeclaration");
+            assertObject(d, "functionDeclaration");
             if (!d.name) fail("Function declaration requires a name");
-            const x = [d.name, d.description || null];
+            const name = toolName(d.name);
+            const description =
+                name === d.name ? d.description : `${d.description || ""}\nOriginal tool name: ${d.name}`.trim();
+            const x = [name, description || null];
             const ps = d.parameters || d.parametersJsonSchema;
             if (ps) x[2] = encSchema(ps);
             decls.push(x);
@@ -84,37 +150,22 @@ function encTools(tools = []) {
     }
     return decls.length ? [[null, decls]] : null;
 }
-function toPart(p) {
-    fields(
-        p,
-        [
-            "text",
-            "inlineData",
-            "inline_data",
-            "functionCall",
-            "function_call",
-            "functionResponse",
-            "function_response",
-            "thought",
-            "thoughtSignature",
-            "thought_signature",
-        ],
-        "part"
-    );
+function toPart(p, toolName) {
+    assertObject(p, "part");
     const a = [],
         d = p.inlineData || p.inline_data,
         fc = p.functionCall || p.function_call,
         fr = p.functionResponse || p.function_response;
     if (typeof p.text === "string") a[1] = p.text;
     else if (d) {
-        fields(d, ["mimeType", "mime_type", "data"], "inlineData");
+        assertObject(d, "inlineData");
         a[2] = [d.mimeType || d.mime_type, d.data];
     } else if (fc) {
-        fields(fc, ["name", "args", "id"], "functionCall");
-        a[10] = [fc.name, encStruct(fc.args || {}), fc.id || null];
+        assertObject(fc, "functionCall");
+        a[10] = [toolName(fc.name), encStruct(fc.args || {}), fc.id || null];
     } else if (fr) {
-        fields(fr, ["name", "response", "id"], "functionResponse");
-        a[11] = [fr.name, encStruct(fr.response || {}), fr.id || null];
+        assertObject(fr, "functionResponse");
+        a[11] = [toolName(fr.name), encStruct(fr.response || {}), fr.id || null];
     } else if (!(p.thoughtSignature || p.thought_signature)) return fail("Unsupported or empty MakerSuite part");
     if (p.thought != null) a[12] = !!p.thought;
     const signature = p.thoughtSignature || p.thought_signature;
@@ -123,46 +174,46 @@ function toPart(p) {
     else if (signature) a[14] = signature;
     return fill(a);
 }
-function toContent(c) {
-    fields(c, ["role", "parts"], "content");
+function toContent(c, toolName) {
+    assertObject(c, "content");
     if (!Array.isArray(c.parts) || !c.parts.length) fail("Content requires parts");
     if (c.role && !["user", "model", "system"].includes(c.role)) fail("Unsupported content role");
-    return [c.parts.map(toPart), c.role === "model" ? "model" : "user"];
+    return [c.parts.map(p => toPart(p, toolName)), c.role === "model" ? "model" : "user"];
 }
 function buildBody(model, g) {
-    fields(
-        g,
-        [
-            "contents",
-            "generationConfig",
-            "generation_config",
-            "systemInstruction",
-            "system_instruction",
-            "safetySettings",
-            "safety_settings",
-            "tools",
-            "toolConfig",
-            "tool_config",
-            "model",
-        ],
-        "request"
-    );
+    // Studio rejects 64-character names; keep aliases private to this request.
+    const toolNames = new Map();
+    const originalNames = new Set();
+    for (const t of g.tools || [])
+        for (const d of t.functionDeclarations || t.function_declarations || []) originalNames.add(d.name);
+    for (const c of g.contents || [])
+        for (const p of c.parts || []) {
+            const f = p.functionCall || p.function_call || p.functionResponse || p.function_response;
+            if (f) originalNames.add(f.name);
+        }
+    const aliases = new Map();
+    const toolName = name => {
+        if (typeof name !== "string" || !name) fail("Function requires a name");
+        if (/^[A-Za-z_][A-Za-z0-9_.-]{0,62}$/.test(name)) return name;
+        if (aliases.has(name)) return aliases.get(name);
+        let alias,
+            salt = 0;
+        do {
+            const hash = createHash("sha256")
+                .update(name + (salt ? `:${salt}` : ""))
+                .digest("hex")
+                .slice(0, 20);
+            alias = `tool_${name.replace(/[^A-Za-z0-9_.-]/g, "_").slice(-32)}_${hash}`;
+            salt++;
+        } while (originalNames.has(alias) || toolNames.has(alias));
+        aliases.set(name, alias);
+        toolNames.set(alias, name);
+        return alias;
+    };
+    assertObject(g, "request");
     const gc = g.generationConfig || g.generation_config || {},
         tc = gc.thinkingConfig || gc.thinking_config;
-    fields(
-        gc,
-        [
-            "stopSequences",
-            "maxOutputTokens",
-            "temperature",
-            "topP",
-            "topK",
-            "responseMimeType",
-            "thinkingConfig",
-            "thinking_config",
-        ],
-        "generationConfig"
-    );
+    assertObject(gc, "generationConfig");
     const cfg = [];
     if (gc.stopSequences) cfg[1] = gc.stopSequences;
     cfg[3] = gc.maxOutputTokens ?? 65536;
@@ -170,44 +221,38 @@ function buildBody(model, g) {
     cfg[5] = gc.topP ?? 0.95;
     cfg[6] = gc.topK ?? 64;
     if (gc.responseMimeType) cfg[7] = gc.responseMimeType;
+    if (gc.responseSchema !== undefined) cfg[8] = encSchema(gc.responseSchema);
+    if (gc.seed !== undefined) {
+        if (!Number.isInteger(gc.seed) || gc.seed < -2147483648 || gc.seed > 2147483647)
+            fail("Invalid generationConfig.seed");
+        cfg[18] = gc.seed;
+    }
     cfg[13] = 1;
     if (tc) {
-        fields(tc, ["includeThoughts", "thinkingBudget", "thinkingLevel"], "thinkingConfig");
+        assertObject(tc, "thinkingConfig");
         const th = [];
         if (tc.includeThoughts != null) th[0] = tc.includeThoughts ? 1 : 0;
         if (tc.thinkingBudget != null) th[1] = tc.thinkingBudget;
         if (tc.thinkingLevel != null) {
             const level = { high: 2, low: 1 }[String(tc.thinkingLevel).toLowerCase()];
-            if (!Number.isInteger(level))
-                fail("MakerSuite bridge supports only LOW/HIGH thinkingLevel; use thinkingBudget for other settings");
-            th[3] = level;
+            if (Number.isInteger(level)) th[3] = level;
         }
         cfg[16] = fill(th);
     }
-    // AUTO is the native default; other tool-choice modes have no verified mapping yet.
-    const toolConfig = g.toolConfig || g.tool_config;
-    if (toolConfig) {
-        fields(toolConfig, ["functionCallingConfig"], "toolConfig");
-        const fc = toolConfig.functionCallingConfig;
-        if (fc) {
-            fields(fc, ["mode"], "functionCallingConfig");
-            if (fc.mode && String(fc.mode).toUpperCase() !== "AUTO")
-                fail("MakerSuite bridge currently supports only AUTO tool choice");
-        }
-    }
+    // Unmapped tool-choice settings fall back to the upstream AUTO default.
     let safety = [7, 8, 9, 10].map(c => [null, null, c, 5]);
     const settings = g.safetySettings || g.safety_settings;
     if (settings)
         safety = settings.map(s => {
-            fields(s, ["category", "threshold"], "safetySettings");
+            assertObject(s, "safetySettings");
             if (!Number.isInteger(CAT[s.category]) || !Number.isInteger(THR[s.threshold]))
                 fail("Unknown MakerSuite safety category or threshold");
             return [null, null, CAT[s.category], THR[s.threshold]];
         });
     if (!Array.isArray(g.contents) || !g.contents.length) fail("Generation requires contents");
-    const contents = g.contents.map(toContent),
+    const contents = g.contents.map(c => toContent(c, toolName)),
         si = g.systemInstruction || g.system_instruction;
-    const sys = si ? toContent(si) : null;
+    const sys = si ? toContent(si, toolName) : null;
     if (sys) sys[1] = "user";
     const body = [
         "models/" + model,
@@ -216,7 +261,7 @@ function buildBody(model, g) {
         fill(cfg),
         null,
         sys,
-        encTools(g.tools),
+        encTools(g.tools, toolName),
         null,
         null,
         null,
@@ -229,9 +274,9 @@ function buildBody(model, g) {
         .flatMap(c => c[0])
         .map(p => (p[1] != null ? p[1] : p[2] ? p[2][1] : ""))
         .join(" ");
-    return { body, ht };
+    return { body, ht, toolNames };
 }
-function convChunk(m) {
+function convChunk(m, toolNames) {
     const out = {};
     if (Array.isArray(m[0]))
         out.candidates = m[0].map((c, i) => {
@@ -241,7 +286,7 @@ function convChunk(m) {
                 if (typeof p[1] === "string") o.text = p[1];
                 if (Array.isArray(p[2])) o.inlineData = { data: p[2][1], mimeType: p[2][0] };
                 if (Array.isArray(p[10])) {
-                    o.functionCall = { args: decStruct(p[10][1]), name: p[10][0] };
+                    o.functionCall = { args: decStruct(p[10][1]), name: toolNames?.get(p[10][0]) || p[10][0] };
                     if (p[10][2]) o.functionCall.id = p[10][2];
                 }
                 if (p[12] === 1 || p[12] === true) o.thought = true;
@@ -250,7 +295,10 @@ function convChunk(m) {
                 return o;
             });
             const cand = { content: { parts, role: "model" }, index: i };
-            if (c[1]) cand.finishReason = Object.hasOwn(FIN, c[1]) ? FIN[c[1]] : "OTHER";
+            if (c[1]) {
+                cand.finishReason = Object.hasOwn(FIN, c[1]) ? FIN[c[1]] : "OTHER";
+                cand.finishReasonCode = c[1];
+            }
             return cand;
         });
     if (Array.isArray(m[2])) {
@@ -278,6 +326,7 @@ function merge(chunks) {
                 candidates.set(c.index, dest);
             }
             if (c.finishReason) dest.finishReason = c.finishReason;
+            if (c.finishReasonCode != null) dest.finishReasonCode = c.finishReasonCode;
             for (const p of c.content.parts) {
                 const last = dest.content.parts.at(-1);
                 if (p.text != null && last?.text != null && !!last.thought === !!p.thought && !last.thoughtSignature) {
@@ -299,9 +348,27 @@ function merge(chunks) {
     out.candidates = [...candidates.values()];
     if (!out.candidates.length || out.candidates.some(c => !c.finishReason))
         fail("MakerSuite response ended without a confirmed finish reason", 502);
+    // An empty completion is not a successful answer: the client would receive neither
+    // text nor a tool call. Surface it so the request can switch accounts instead of
+    // reporting a fake success.
+    const hasContent = out.candidates.some(candidate =>
+        (candidate.content?.parts || []).some(
+            part =>
+                (typeof part.text === "string" && part.text.length > 0) ||
+                (typeof part.functionCall?.name === "string" && part.functionCall.name.length > 0) ||
+                (typeof part.inlineData?.data === "string" && part.inlineData.data.length > 0)
+        )
+    );
+    if (!hasContent)
+        fail(
+            `MakerSuite upstream returned an empty completion (finishReason=${out.candidates
+                .map(candidate => candidate.finishReason + (candidate.finishReasonCode != null ? `; code=${candidate.finishReasonCode}` : ""))
+                .join(",")})`,
+            503
+        );
     return out;
 }
-function wrapResponse(text, streamed) {
+function wrapResponse(text, streamed, toolNames) {
     let root;
     try {
         root = JSON.parse(text);
@@ -322,7 +389,7 @@ function wrapResponse(text, streamed) {
             throw Object.assign(new Error(record[1]), { rpcStatus: record, status: RPC_STATUS[record[0]] || 502 });
         }
     }
-    const chunks = arr.filter(isChunk).map(convChunk);
+    const chunks = arr.filter(isChunk).map(m => convChunk(m, toolNames));
     const merged = merge(chunks); // Validate completion even when returning the old streamed envelope.
     if (!streamed) return JSON.stringify([JSON.stringify(merged)]);
     const tail = arr.length && !isChunk(arr.at(-1)) ? arr.at(-1) : null;

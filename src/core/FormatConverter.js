@@ -7,6 +7,7 @@
 
 const axios = require("axios");
 const mime = require("mime-types");
+const { createHash, randomUUID } = require("node:crypto");
 
 /**
  * Format Converter Module
@@ -171,6 +172,85 @@ class FormatConverter {
     constructor(logger, serverSystem) {
         this.logger = logger;
         this.serverSystem = serverSystem;
+        // shortcut: process-local, one-hour history; use shared storage before adding replicas.
+        this.toolContexts = new Map();
+    }
+
+    _toolArgsHash(args) {
+        // Clients may reorder JSON object keys without changing the tool arguments.
+        const json = JSON.stringify(args || {}, (_key, value) =>
+            value && typeof value === "object" && !Array.isArray(value)
+                ? Object.fromEntries(
+                      Object.keys(value)
+                          .sort()
+                          .map(key => [key, value[key]])
+                  )
+                : value
+        );
+        return createHash("sha256").update(json).digest("hex");
+    }
+
+    _rememberToolCall(part, model, prefix) {
+        const id = prefix + randomUUID().replaceAll("-", "");
+        const call = part.functionCall;
+        const signature = part.thoughtSignature;
+        if (
+            (!signature || (typeof signature === "string" && signature.length <= 16384)) &&
+            (!call.id || (typeof call.id === "string" && call.id.length <= 256))
+        ) {
+            const now = Date.now();
+            for (const [key, value] of this.toolContexts) {
+                if (value.expires > now) break;
+                this.toolContexts.delete(key);
+            }
+            this.toolContexts.set(id, {
+                argsHash: this._toolArgsHash(call.args),
+                expires: now + 3600000,
+                model,
+                name: call.name,
+                signature,
+                upstreamId: call.id,
+            });
+            while (this.toolContexts.size > 1024) this.toolContexts.delete(this.toolContexts.keys().next().value);
+        }
+        return id;
+    }
+
+    _toolContext(id, model, name, args) {
+        const entry = this.toolContexts.get(id);
+        if (!entry) return null;
+        if (entry.expires <= Date.now()) {
+            this.toolContexts.delete(id);
+            return null;
+        }
+        if (
+            entry.model !== model ||
+            entry.name !== name ||
+            (args !== undefined && entry.argsHash !== this._toolArgsHash(args))
+        )
+            return null;
+        return entry;
+    }
+
+    _restoreToolCall(part, id, model) {
+        const entry = this._toolContext(id, model, part.functionCall.name, part.functionCall.args || {});
+        if (!entry) return;
+        if (entry.signature) part.thoughtSignature = entry.signature;
+        else delete part.thoughtSignature;
+        if (entry.upstreamId) part.functionCall.id = entry.upstreamId;
+    }
+
+    _restoreToolResult(part, id, model) {
+        const entry = this._toolContext(id, model, part.functionResponse.name);
+        if (entry?.upstreamId) part.functionResponse.id = entry.upstreamId;
+    }
+
+    resolveClaudeUpstreamModel(modelName) {
+        if (typeof modelName !== "string" || !/^claude(?:[-_]|$)/i.test(modelName)) return modelName;
+        const configured = process.env.CLAUDE_UPSTREAM_MODEL || this.serverSystem?.config?.claudeUpstreamModel || "gemini-4-argon";
+        const target = String(configured).replace(/^models\//, "");
+        this.logger.info(`[Adapter] Mapping Claude model "${modelName}" to Gemini upstream model "${target}".`);
+        return target;
     }
 
     getDefaultSafetySettings() {
@@ -316,8 +396,8 @@ class FormatConverter {
     }
 
     /**
-     * Sanitize tools in native Gemini requests by removing unsupported JSON Schema fields
-     * like $schema and additionalProperties
+     * Normalize native Gemini tool schemas using the shared adapter path.
+     * Unmapped constraints remain visible to the transport validator.
      * @param {object} geminiBody - Gemini format request body
      * @returns {object} - Modified request body with sanitized tools
      */
@@ -325,28 +405,6 @@ class FormatConverter {
         if (!geminiBody || !geminiBody.tools || !Array.isArray(geminiBody.tools)) {
             return geminiBody;
         }
-
-        // Helper function to recursively sanitize schema:
-        // 1. Remove unsupported fields ($schema, additionalProperties)
-        // 2. Convert lowercase type to uppercase (object -> OBJECT, string -> STRING, etc.)
-        const sanitizeSchema = obj => {
-            if (!obj || typeof obj !== "object") return obj;
-
-            const result = Array.isArray(obj) ? [] : {};
-
-            for (const key of Object.keys(obj)) {
-                if (key === "type" && typeof obj[key] === "string") {
-                    // Convert lowercase type to uppercase for Gemini
-                    result[key] = obj[key].toUpperCase();
-                } else if (typeof obj[key] === "object" && obj[key] !== null) {
-                    result[key] = sanitizeSchema(obj[key]);
-                } else {
-                    result[key] = obj[key];
-                }
-            }
-
-            return result;
-        };
 
         // Process each tool
         for (const tool of geminiBody.tools) {
@@ -356,8 +414,8 @@ class FormatConverter {
                     : tool.function_declarations;
             if (declarations && Array.isArray(declarations)) {
                 for (const funcDecl of declarations) {
-                    if (funcDecl.parameters) {
-                        funcDecl.parameters = sanitizeSchema(funcDecl.parameters);
+                    for (const key of ["parameters", "parametersJsonSchema"]) {
+                        if (funcDecl[key]) funcDecl[key] = this._convertSchemaToGemini(funcDecl[key]);
                     }
                 }
             }
@@ -371,161 +429,91 @@ class FormatConverter {
      * Handles nullable types, enums, and ensures uppercase types.
      *
      * @param {Object} obj - The schema object to convert
-     * @param {boolean} [isResponseSchema=false] - If true, applies stricter rules (e.g. anyOf for unions) for Structured Outputs
+     * @param {boolean} [isResponseSchema=false] - Retains existing string-enum normalization for Structured Outputs
      * @param {boolean} [isProperties=false] - If true, the current object is a map of property definitions, so keys should not be filtered
      * @returns {Object} The converted schema
      */
     _convertSchemaToGemini(obj, isResponseSchema = false, isProperties = false) {
         if (!obj || typeof obj !== "object") return obj;
+        if (Array.isArray(obj)) return obj.map(value => this._convertSchemaToGemini(value, isResponseSchema));
+        if (isProperties) {
+            return Object.fromEntries(
+                Object.entries(obj).map(([name, schema]) => [
+                    name,
+                    this._convertSchemaToGemini(schema, isResponseSchema),
+                ])
+            );
+        }
 
-        const result = Array.isArray(obj) ? [] : {};
-
-        for (const key of Object.keys(obj)) {
-            // 1. Filter out unsupported fields using a blacklist approach
-            const unsupportedKeys = [
-                "$schema",
-                "additionalProperties",
-                "ref",
-                "$ref",
-                "propertyNames",
-                "patternProperties",
-                "unevaluatedProperties",
-                "exclusiveMinimum",
-                "exclusiveMaximum",
-                "const",
-                "$comment",
-                "enumDescriptions",
-            ];
-
-            if (isResponseSchema) {
-                // For Structured Outputs: stricter filtering of metadata that causes 400 errors
-                unsupportedKeys.push("default", "examples", "$defs", "id");
-            }
-
-            // ONLY Filter metadata keywords if NOT a property name (isProperties is false)
-            if (!isProperties && unsupportedKeys.includes(key)) {
-                continue;
-            }
-
-            // Handle anyOf specially (only when it is a schema keyword),
-            // but `{"type":"OBJECT","properties":{"isNewTopic":{"type":"BOOLEAN"},"title":{"anyOf":[{"type":"STRING"},{"type":"NULL"}]}},"required":["isNewTopic","title"]}` is right, need to confirm
-            if (key === "anyOf" && !isProperties) {
-                if (Array.isArray(obj[key])) {
-                    const variants = obj[key];
-                    const hasNull = variants.some(v => v.type === "null");
-                    const nonNullVariants = variants.filter(v => v.type !== "null");
-
-                    if (hasNull) {
-                        result.nullable = true;
-                    }
-
-                    if (nonNullVariants.length === 1) {
-                        // Collapse single variant. Reset isProperties to false for the variant's schema.
-                        const converted = this._convertSchemaToGemini(nonNullVariants[0], isResponseSchema, false);
-                        // Merge converted properties into result
-                        Object.assign(result, converted);
-                        if (hasNull) result.nullable = true;
-                        continue; // Skip setting 'anyOf' explicitly
-                    } else if (nonNullVariants.length > 0) {
-                        // Keep anyOf for multiple variants. Reset isProperties for sub-schemas.
-                        result.anyOf = nonNullVariants.map(v =>
-                            this._convertSchemaToGemini(v, isResponseSchema, false)
-                        );
-                        continue;
-                    } else if (hasNull) {
-                        // Only null type? Keep it as nullable without forcing a specific type.
-                        continue;
-                    }
-                }
-            }
-
-            // Handle type specially (only when it is a schema keyword)
-            if (key === "type" && !isProperties) {
-                if (Array.isArray(obj[key])) {
-                    // Handle nullable types like ["string", "null"]
-                    const types = obj[key];
-                    const nonNullTypes = types.filter(t => t !== "null");
-                    const hasNull = types.includes("null");
-
-                    if (hasNull) {
-                        result.nullable = true;
-                    }
-
-                    if (nonNullTypes.length === 1) {
-                        // Single non-null type: use it directly
-                        result[key] = nonNullTypes[0].toUpperCase();
-                    } else if (nonNullTypes.length > 1) {
-                        // Multiple non-null types: e.g. ["string", "integer"]
-                        if (isResponseSchema) {
-                            // For Response Schema: Gemini doesn't support array types, use anyOf
-                            result.anyOf = nonNullTypes.map(t => ({
-                                type: t.toUpperCase(),
-                            }));
-                        } else {
-                            result[key] = nonNullTypes.map(t => t.toUpperCase());
-                        }
-                    } else {
-                        // Only null type, default to STRING
-                        result[key] = "STRING";
-                    }
-                } else if (typeof obj[key] === "string") {
-                    // Convert lowercase type to uppercase for Gemini
-                    result[key] = obj[key].toUpperCase();
-                } else if (typeof obj[key] === "object" && obj[key] !== null) {
-                    // Type being an object is a sub-schema definition, not property name mapping
-                    result[key] = this._convertSchemaToGemini(obj[key], isResponseSchema, false);
-                } else {
-                    result[key] = obj[key];
-                }
-            } else if (key === "enum" && !isProperties) {
-                // 2. Ensure all enum values are strings (Only for Response Schema)
-                if (isResponseSchema) {
-                    if (Array.isArray(obj[key])) {
-                        result[key] = obj[key].map(String);
-                    } else if (obj[key] !== undefined && obj[key] !== null) {
-                        result[key] = [String(obj[key])];
-                    }
-                    result["type"] = "STRING";
-                } else {
-                    // For Tools: Allow original enum values
-                    result[key] = obj[key];
-                }
-            } else if (typeof obj[key] === "object" && obj[key] !== null) {
-                // Recursion logic:
-                // - If key is 'properties', next level is a map of property NAMES. Set isProperties = true.
-                // - Otherwise, if we were currently in a properties map (isProperties is true),
-                //   the value is a schema definition. For its keys, isProperties MUST be false.
-                const nextIsProperties = key === "properties";
-                const recursionFlag = isProperties ? false : nextIsProperties;
-
-                result[key] = this._convertSchemaToGemini(obj[key], isResponseSchema, recursionFlag);
+        const result = {};
+        let typeUnion;
+        let nullableUnion = false;
+        let stringEnum = false;
+        // Presentation-only JSON Schema metadata has no native Schema field.
+        const metadata = new Set([
+            "$schema",
+            "$comment",
+            "$defs",
+            "definitions",
+            "id",
+            "$id",
+            "title",
+            "default",
+            "examples",
+            "deprecated",
+            "readOnly",
+            "writeOnly",
+            "enumDescriptions",
+        ]);
+        for (const [key, value] of Object.entries(obj)) {
+            if (metadata.has(key)) continue;
+            if (key === "type") {
+                const types = (Array.isArray(value) ? value : [value]).map(type =>
+                    typeof type === "string" ? type.toUpperCase() : type
+                );
+                const nonNull = types.filter(type => type !== "NULL");
+                if (types.includes("NULL")) nullableUnion = true;
+                if (nonNull.length > 1) {
+                    // Native Schema has anyOf, but no JSON-Schema type-array field.
+                    typeUnion = nonNull.map(type => ({ type }));
+                } else result.type = nonNull[0] || "NULL";
+            } else if (key === "properties") {
+                result.properties = this._convertSchemaToGemini(value, isResponseSchema, true);
+            } else if (["items", "not"].includes(key)) {
+                result[key] = this._convertSchemaToGemini(value, isResponseSchema);
+            } else if (["anyOf", "oneOf", "allOf"].includes(key) && Array.isArray(value)) {
+                const nullBranch = schema => typeof schema?.type === "string" && schema.type.toUpperCase() === "NULL";
+                const hasNull = key !== "allOf" && value.some(nullBranch);
+                if (hasNull) nullableUnion = true;
+                const branches = hasNull ? value.filter(schema => !nullBranch(schema)) : value;
+                if (hasNull && branches.length === 0) result.type = "NULL";
+                else result[key] = branches.map(schema => this._convertSchemaToGemini(schema, isResponseSchema));
+            } else if (key === "enum" && isResponseSchema && Array.isArray(value)) {
+                result.enum = value.map(String);
+                stringEnum = true;
             } else {
-                result[key] = obj[key];
+                // Preserve constraints; the transport rejects unmapped fields instead of weakening them.
+                Object.defineProperty(result, key, { value, enumerable: true, configurable: true, writable: true });
             }
         }
 
-        if (!isProperties && Array.isArray(obj.enumDescriptions) && obj.enumDescriptions.length > 0) {
-            const enumValues = Array.isArray(result.enum) ? result.enum : [];
-            const enumDescriptionLines = obj.enumDescriptions
-                .map((description, index) => {
-                    if (description === undefined || description === null || description === "") {
-                        return null;
-                    }
-
-                    const enumValue = enumValues[index];
-                    const label = enumValue === undefined ? `value ${index + 1}` : String(enumValue);
-                    return `- ${label}: ${description}`;
-                })
-                .filter(Boolean);
-
-            if (enumDescriptionLines.length > 0) {
-                const enumDescriptionText = `Enum descriptions:\n${enumDescriptionLines.join("\n")}`;
-                result.description = result.description
-                    ? `${result.description}\n\n${enumDescriptionText}`
-                    : enumDescriptionText;
-            }
+        if (nullableUnion) result.nullable = true;
+        if (stringEnum) result.type = "STRING";
+        if (typeUnion) {
+            if (obj.anyOf) result.allOf = [...(result.allOf || []), { anyOf: typeUnion }];
+            else result.anyOf = typeUnion;
         }
-
+        if (Array.isArray(obj.enumDescriptions)) {
+            const lines = obj.enumDescriptions.flatMap((description, index) =>
+                description == null || description === ""
+                    ? []
+                    : [`- ${obj.enum?.[index] ?? `value ${index + 1}`}: ${description}`]
+            );
+            if (lines.length)
+                result.description = [result.description, `Enum descriptions:\n${lines.join("\n")}`]
+                    .filter(Boolean)
+                    .join("\n\n");
+        }
         return result;
     }
 
@@ -591,6 +579,7 @@ class FormatConverter {
 
         // Convert conversation messages
         const conversationMessages = openaiBody.messages.filter(msg => msg.role !== "system");
+        const toolCallNames = new Map();
 
         // Buffer for accumulating consecutive tool message parts
         // Gemini requires alternating roles, so consecutive tool messages must be merged
@@ -674,8 +663,13 @@ class FormatConverter {
                     responseContent = { result: message.content };
                 }
 
-                // Use function name from tool message (OpenAI format always includes name)
-                const functionName = message.name || "unknown_function";
+                if (responseContent === null || typeof responseContent !== "object" || Array.isArray(responseContent)) {
+                    responseContent = { result: responseContent ?? null };
+                }
+
+                // OpenAI tool results may omit name; resolve the corresponding historical call.
+                const functionName = message.name || toolCallNames.get(message.tool_call_id);
+                if (!functionName) throw Object.assign(new Error("Tool result has no matching function call"), { status: 400 });
 
                 // Add to buffer instead of pushing directly
                 // This allows merging consecutive tool messages into one user message
@@ -686,6 +680,7 @@ class FormatConverter {
                         response: responseContent,
                     },
                 };
+                this._restoreToolResult(functionResponsePart, message.tool_call_id, cleanModelName);
                 pendingToolParts.push(functionResponsePart);
                 continue;
             }
@@ -719,6 +714,7 @@ class FormatConverter {
                             args = {};
                         }
 
+                        if (toolCall.id) toolCallNames.set(toolCall.id, toolCall.function.name);
                         const functionCallPart = {
                             functionCall: {
                                 args,
@@ -734,6 +730,7 @@ class FormatConverter {
                                 `[Adapter] Using dummy thoughtSignature for first functionCall: ${toolCall.function.name}`
                             );
                         }
+                        this._restoreToolCall(functionCallPart, toolCall.id, cleanModelName);
                         googleParts.push(functionCallPart);
                     }
                 }
@@ -1111,7 +1108,45 @@ class FormatConverter {
      * @param {string} modelName - The model name
      * @param {object} streamState - Optional state object to track thought mode
      */
-    translateGoogleToOpenAIStream(googleChunk, modelName = "gemini-2.5-flash-lite", streamState = null) {
+    _readGoogleStreamFrames(chunk, state, final = false) {
+        state.googleStreamBuffer = (state.googleStreamBuffer || "") + String(chunk || "");
+        const frames = [];
+        const decode = frame => {
+            const lines = frame.split(/\r?\n/);
+            const data = lines.filter(line => line.startsWith("data:")).map(line => line.slice(5).trimStart());
+            const payload = (data.length ? data.join("\n") : frame).trim();
+            if (!payload || (!data.length && /^(?:event:|id:|retry:|:)/.test(payload))) return true;
+            if (payload === "[DONE]") { frames.push(payload); return true; }
+            try { JSON.parse(payload); frames.push(payload); return true; } catch { return false; }
+        };
+        let boundary;
+        while ((boundary = /\r?\n\r?\n/.exec(state.googleStreamBuffer))) {
+            const frame = state.googleStreamBuffer.slice(0, boundary.index);
+            state.googleStreamBuffer = state.googleStreamBuffer.slice(boundary.index + boundary[0].length);
+            if (!decode(frame)) throw Object.assign(new Error("Malformed upstream SSE event"), { status: 502 });
+        }
+        // Only consume incomplete SSE frames at EOF. Raw buffered responses have no SSE delimiter.
+        const tail = state.googleStreamBuffer.trim();
+        if (tail && (final || /^[{[]/.test(tail))) {
+            if (decode(tail)) state.googleStreamBuffer = "";
+            else if (final) throw Object.assign(new Error("Upstream stream ended with an incomplete event"), { status: 502 });
+        }
+        return frames;
+    }
+
+    translateGoogleToOpenAIStream(chunk, model = "gemini-2.5-flash-lite", state = {}, final = false) {
+        state ||= {};
+        return this._readGoogleStreamFrames(chunk, state, final)
+            .map(frame => this._translateGoogleToOpenAIFrame(frame, model, state) || "").join("") || null;
+    }
+
+    translateGoogleToClaudeStream(chunk, model = "gemini-2.5-flash-lite", state = {}, final = false) {
+        state ||= {};
+        return this._readGoogleStreamFrames(chunk, state, final)
+            .map(frame => this._translateGoogleToClaudeFrame(frame, model, state) || "").join("") || null;
+    }
+
+    _translateGoogleToOpenAIFrame(googleChunk, modelName = "gemini-2.5-flash-lite", streamState = null) {
         this.logger.debug(`[Adapter] Debug: Received Google chunk for OpenAI: ${googleChunk}`);
 
         // Ensure streamState exists to properly track tool call indices
@@ -1184,15 +1219,15 @@ class FormatConverter {
                 const delta = {};
                 let hasContent = false;
 
-                if (part.thought === true) {
+                if (!part.functionCall && part.thought === true) {
                     if (part.text) {
                         delta.reasoning_content = part.text;
                         hasContent = true;
                     }
-                } else if (part.text) {
+                } else if (!part.functionCall && part.text) {
                     delta.content = part.text;
                     hasContent = true;
-                } else if (part.inlineData) {
+                } else if (!part.functionCall && part.inlineData) {
                     const image = part.inlineData;
                     delta.content = `![Generated Image](data:${image.mimeType};base64,${image.data})`;
                     this.logger.info("[Adapter] Successfully parsed image from streaming response chunk.");
@@ -1200,7 +1235,7 @@ class FormatConverter {
                 } else if (part.functionCall) {
                     // Convert Gemini functionCall to OpenAI tool_calls format
                     const funcCall = part.functionCall;
-                    const toolCallId = `call_${this._generateRequestId()}`;
+                    const toolCallId = this._rememberToolCall(part, modelName, "call_");
 
                     // Track tool call index for multiple function calls
                     const toolCallIndex = streamState.toolCallIndex ?? 0;
@@ -1293,17 +1328,13 @@ class FormatConverter {
      * @param {object} streamState - State object to track stream progress
      * @returns {string|null} - SSE formatted events for Response API
      */
-    translateGoogleToResponseAPIStream(googleChunk, modelName = "gemini-2.5-flash-lite", streamState = null) {
+    translateGoogleToResponseAPIStream(googleChunk, modelName = "gemini-2.5-flash-lite", streamState = null, final = false) {
         this.logger.debug(`[Adapter] Debug: Received Google chunk for Response API: ${googleChunk}`);
 
         // Ensure streamState exists
         if (!streamState) {
             this.logger.warn("[Adapter] streamState not provided, creating default state.");
             streamState = {};
-        }
-
-        if (!googleChunk || googleChunk.trim() === "") {
-            return null;
         }
 
         const eventsToSend = [];
@@ -1603,7 +1634,7 @@ class FormatConverter {
                 for (const part of candidate.content.parts) {
                     // The Responses API exposes reasoning summaries via `summary` + `response.reasoning_summary_text.*`.
                     // Map Gemini "thought" parts to reasoning *summary* to match official expectations.
-                    if (part?.thought === true) {
+                    if (!part?.functionCall && part?.thought === true) {
                         if (part?.text) {
                             const reasoningItem = ensureReasoningItem();
                             streamState.reasoningSummaryText += part.text;
@@ -1631,7 +1662,7 @@ class FormatConverter {
                         continue;
                     }
 
-                    if (part?.text) {
+                    if (!part?.functionCall && part?.text) {
                         const messageItem = ensureMessageItem();
                         streamState.messageText += part.text;
 
@@ -1641,7 +1672,7 @@ class FormatConverter {
                             item_id: messageItem.id,
                             output_index: messageItem.output_index,
                         });
-                    } else if (part?.inlineData) {
+                    } else if (!part?.functionCall && part?.inlineData) {
                         // This proxy intentionally does not expose image outputs in Responses API because many
                         // clients treat `image_generation_call` as a hosted tool call and may initiate a second
                         // tool-execution roundtrip that Gemini image models cannot support (function calling).
@@ -1662,7 +1693,7 @@ class FormatConverter {
                     } else if (part?.functionCall) {
                         const funcCall = part.functionCall;
                         const itemId = `fc_${this._generateRequestId()}`;
-                        const callId = `call_${this._generateRequestId()}`;
+                        const callId = this._rememberToolCall(part, modelName, "call_");
                         const outputIndex = streamState.nextOutputIndex++;
                         const args = JSON.stringify(funcCall.args || {});
 
@@ -1747,10 +1778,7 @@ class FormatConverter {
         };
 
         // Google streaming might concatenate multiple SSE frames; handle them safely.
-        const frames = String(googleChunk)
-            .split(/\n\n+/)
-            .map(s => s.trim())
-            .filter(Boolean);
+        const frames = this._readGoogleStreamFrames(googleChunk, streamState, final);
 
         for (const frame of frames) {
             let jsonString = frame;
@@ -1819,17 +1847,17 @@ class FormatConverter {
 
         if (candidate.content && Array.isArray(candidate.content.parts)) {
             for (const part of candidate.content.parts) {
-                if (part.thought === true) {
+                if (!part.functionCall && part.thought === true) {
                     reasoning_content += part.text || "";
-                } else if (part.text) {
+                } else if (!part.functionCall && part.text) {
                     content += part.text;
-                } else if (part.inlineData) {
+                } else if (!part.functionCall && part.inlineData) {
                     const image = part.inlineData;
                     content += `![Generated Image](data:${image.mimeType};base64,${image.data})`;
                 } else if (part.functionCall) {
                     // Convert Gemini functionCall to OpenAI tool_calls format
                     const funcCall = part.functionCall;
-                    const toolCallId = `call_${this._generateRequestId()}`;
+                    const toolCallId = this._rememberToolCall(part, modelName, "call_");
 
                     const toolCallObj = {
                         function: {
@@ -1953,13 +1981,13 @@ class FormatConverter {
         if (candidate.content && Array.isArray(candidate.content.parts)) {
             for (const part of candidate.content.parts) {
                 // Responses API supports reasoning output items; map Gemini "thought" parts into a reasoning *summary*.
-                if (part?.thought === true) {
+                if (!part?.functionCall && part?.thought === true) {
                     if (part?.text) reasoningContent += part.text;
                     continue;
-                } else if (part.text) {
+                } else if (!part.functionCall && part.text) {
                     // Regular text content
                     messageContent += part.text;
-                } else if (part.inlineData) {
+                } else if (!part.functionCall && part.inlineData) {
                     // Responses API image outputs are intentionally suppressed by this proxy; preserve a text note.
                     if (!messageContent) {
                         messageContent =
@@ -1968,7 +1996,7 @@ class FormatConverter {
                 } else if (part.functionCall) {
                     // Function call
                     const funcCall = part.functionCall;
-                    const callId = `call_${this._generateRequestId()}`;
+                    const callId = this._rememberToolCall(part, modelName, "call_");
                     output.push({
                         arguments: JSON.stringify(funcCall.args || {}),
                         call_id: callId,
@@ -2150,8 +2178,9 @@ class FormatConverter {
         } = FormatConverter.parseModelBuiltInToolSuffixes(rawModel);
         const { cleanModelName: streamStrippedModel, streamingMode: modelStreamingMode } =
             FormatConverter.parseModelStreamingModeSuffix(toolStrippedModel);
-        const { cleanModelName, thinkingLevel: modelThinkingLevel } =
+        const { cleanModelName: parsedModelName, thinkingLevel: modelThinkingLevel } =
             FormatConverter.parseModelThinkingLevel(streamStrippedModel);
+        const cleanModelName = this.resolveClaudeUpstreamModel(parsedModelName);
 
         const modelForceToolFlags = [];
         if (modelForceWebSearch) modelForceToolFlags.push("forceWebSearch=true");
@@ -2306,12 +2335,11 @@ class FormatConverter {
                             functionName = "unknown_function";
                         }
 
-                        pendingToolParts.push({
-                            functionResponse: {
-                                name: functionName,
-                                response: responseContent,
-                            },
-                        });
+                        const functionResponsePart = {
+                            functionResponse: { name: functionName, response: responseContent },
+                        };
+                        this._restoreToolResult(functionResponsePart, toolUseId, cleanModelName);
+                        pendingToolParts.push(functionResponsePart);
                     }
 
                     // Process non-tool_result content in the same message
@@ -2358,6 +2386,7 @@ class FormatConverter {
                             functionCallPart.thoughtSignature = FormatConverter.DUMMY_THOUGHT_SIGNATURE;
                             signatureAttachedToCall = true;
                         }
+                        this._restoreToolCall(functionCallPart, block.id, cleanModelName);
                         googleParts.push(functionCallPart);
                     } else if (block.type === "thinking") {
                         // Claude thinking block -> Gemini thought
@@ -2672,7 +2701,7 @@ class FormatConverter {
      * @param {string} modelName - The model name
      * @param {object} streamState - State object to track streaming progress
      */
-    translateGoogleToClaudeStream(googleChunk, modelName = "gemini-2.5-flash-lite", streamState = null) {
+    _translateGoogleToClaudeFrame(googleChunk, modelName = "gemini-2.5-flash-lite", streamState = null) {
         this.logger.debug(`[Adapter] Debug: Received Google chunk for Claude: ${googleChunk}`);
 
         if (!streamState) {
@@ -2758,7 +2787,7 @@ class FormatConverter {
         // Process content parts
         if (candidate.content && Array.isArray(candidate.content.parts)) {
             for (const part of candidate.content.parts) {
-                if (part.thought === true && part.text) {
+                if (!part.functionCall && part.thought === true && part.text) {
                     // Thinking content
                     if (!streamState.thinkingBlockStarted) {
                         events.push({
@@ -2775,7 +2804,7 @@ class FormatConverter {
                         index: streamState.thinkingBlockIndex,
                         type: "content_block_delta",
                     });
-                } else if (part.text) {
+                } else if (!part.functionCall && part.text) {
                     // Regular text content
                     if (streamState.thinkingBlockStarted && !streamState.thinkingBlockStopped) {
                         events.push({
@@ -2799,7 +2828,7 @@ class FormatConverter {
                         index: streamState.textBlockIndex,
                         type: "content_block_delta",
                     });
-                } else if (part.inlineData) {
+                } else if (!part.functionCall && part.inlineData) {
                     // Image output - convert to markdown image format for streaming
                     // Close thinking block if open
                     if (streamState.thinkingBlockStarted && !streamState.thinkingBlockStopped) {
@@ -2830,7 +2859,7 @@ class FormatConverter {
                     this.logger.info("[Adapter] Successfully parsed image from streaming response chunk.");
                 } else if (part.functionCall) {
                     // Tool use
-                    const toolUseId = `toolu_${this._generateRequestId()}`;
+                    const toolUseId = this._rememberToolCall(part, modelName, "toolu_");
                     events.push({
                         content_block: {
                             id: toolUseId,
@@ -2949,19 +2978,19 @@ class FormatConverter {
 
         if (candidate.content && Array.isArray(candidate.content.parts)) {
             for (const part of candidate.content.parts) {
-                if (part.thought === true && part.text) {
+                if (!part.functionCall && part.thought === true && part.text) {
                     const thinkingBlock = {
                         signature: part.thoughtSignature || FormatConverter.DUMMY_THOUGHT_SIGNATURE,
                         thinking: part.text,
                         type: "thinking",
                     };
                     content.push(thinkingBlock);
-                } else if (part.text) {
+                } else if (!part.functionCall && part.text) {
                     content.push({
                         text: part.text,
                         type: "text",
                     });
-                } else if (part.inlineData) {
+                } else if (!part.functionCall && part.inlineData) {
                     // Image output - convert to base64 format
                     content.push({
                         text: `![Generated Image](data:${part.inlineData.mimeType};base64,${part.inlineData.data})`,
@@ -2970,7 +2999,7 @@ class FormatConverter {
                 } else if (part.functionCall) {
                     hasToolUse = true;
                     content.push({
-                        id: `toolu_${this._generateRequestId()}`,
+                        id: this._rememberToolCall(part, modelName, "toolu_"),
                         input: part.functionCall.args || {},
                         name: part.functionCall.name,
                         type: "tool_use",
@@ -3178,6 +3207,7 @@ class FormatConverter {
                             },
                             thoughtSignature: FormatConverter.DUMMY_THOUGHT_SIGNATURE,
                         };
+                        this._restoreToolCall(functionCallPart, item.call_id, cleanModelName);
                         googleContents.push({
                             parts: [functionCallPart],
                             role: "model",
@@ -3197,6 +3227,7 @@ class FormatConverter {
                                 response: safeParseJSON(item.output, "unparsed_output"),
                             },
                         };
+                        this._restoreToolResult(functionResponsePart, item.call_id, cleanModelName);
                         googleContents.push({
                             parts: [functionResponsePart],
                             role: "user",

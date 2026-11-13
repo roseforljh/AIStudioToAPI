@@ -40,3 +40,9 @@ debug_*.png
 debug_*.html
 proxylist.txt
 proxy_mapping.json
+
+# Local working backups and one-off debug copies
+.local-backups/
+.integration-backup-path
+*.bak-before-*
+*.bak-*

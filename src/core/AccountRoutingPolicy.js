@@ -8,7 +8,10 @@ class AccountRoutingPolicy {
         this.path = path.join(process.cwd(), 'data', 'account-routing-policy.json');
         this.settings = { paidActive: 3, paidStandby: 2, normalActive: 2, normalStandby: 3 };
         this.modelEvidence = {};
-        try { const d=JSON.parse(fs.readFileSync(this.path,'utf8')); this.settings={...this.settings,...d.settings}; this.modelEvidence=d.modelEvidence||{}; } catch {}
+        // Learned, short-lived group restriction: e.g. a model rejected by a
+        // standard account but accepted by a paid account. Never a hardcoded model list.
+        this.groupEvidence = {};
+        try { const d=JSON.parse(fs.readFileSync(this.path,'utf8')); this.settings={...this.settings,...d.settings}; this.modelEvidence=d.modelEvidence||{}; this.groupEvidence=d.groupEvidence||{}; } catch {}
     }
     group(index) { return this.scanner.get(index)?.state === 'ready-paid' ? 'paid' : 'normal'; }
     update(value) {
@@ -18,7 +21,7 @@ class AccountRoutingPolicy {
         if (sum < 1 || sum > 30 || value.paidActive+value.normalActive < 1) throw new Error('Total must be 1–30 and at least one active account is required');
         this.settings=Object.fromEntries(keys.map(k=>[k,value[k]])); this.persist();
     }
-    persist() { fs.mkdirSync(path.dirname(this.path),{recursive:true,mode:0o700}); const p=this.path+'.tmp';fs.writeFileSync(p,JSON.stringify({settings:this.settings,modelEvidence:this.modelEvidence}),{mode:0o600});fs.renameSync(p,this.path); }
+    persist() { fs.mkdirSync(path.dirname(this.path),{recursive:true,mode:0o700}); const p=this.path+'.tmp';fs.writeFileSync(p,JSON.stringify({settings:this.settings,modelEvidence:this.modelEvidence,groupEvidence:this.groupEvidence}),{mode:0o600});fs.renameSync(p,this.path); }
     targets(indices) {
         const list=[...new Set(indices)];
         const paid=list.filter(i=>this.group(i)==='paid').slice(0,this.settings.paidActive+this.settings.paidStandby);
@@ -53,9 +56,26 @@ class AccountRoutingPolicy {
         this.modelEvidence[model] ||= {};
         const old = this.evidence(index, model) || {};
         this.modelEvidence[model][index] = { fingerprint, until: 0, successAt: Date.now(), successes: Math.min(100000, (old.successes || 0) + 1) };
+        const group = this.group(index);
+        if (this.groupEvidence?.[model]?.[group]) delete this.groupEvidence[model][group];
         this.persist();
     }
-    noteDenied(index, model) { this.markUnsupported(index, model, 600000); }
+    groupDenied(group, model) {
+        model = cleanModel(String(model || ''));
+        const until = this.groupEvidence?.[model]?.[group];
+        return !!until && until > Date.now();
+    }
+    markGroupDenied(group, model, durationMs = 600000) {
+        model = cleanModel(String(model || '')); if (!model) return;
+        (this.groupEvidence ||= {})[model] ||= {};
+        this.groupEvidence[model][group] = Date.now() + durationMs;
+        this.persist();
+    }
+    clearGroupDenied(model) {
+        model = cleanModel(String(model || ''));
+        if (this.groupEvidence?.[model]) { delete this.groupEvidence[model]; this.persist(); }
+    }
+    noteDenied(index, model, options = {}) { this.markUnsupported(index, model, options.accountMs || 600000); }
     markUnsupported(index, model, durationMs = 86400000) {
         model = cleanModel(String(model || '')); if (!model) return;
         const fingerprint = this.scanner.fingerprint(index); if (!fingerprint) return;

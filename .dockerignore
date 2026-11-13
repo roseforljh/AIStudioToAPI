@@ -70,3 +70,9 @@ camoufox*
 scripts/auth
 proxylist.txt
 proxy_mapping.json
+
+# Local backups and deployment-only state
+.local-backups
+.integration-backup-path
+*.bak*
+compose.production.yml

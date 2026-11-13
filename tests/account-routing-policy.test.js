@@ -31,3 +31,20 @@ test('normal account is preferred and ranked known successes are chosen first', 
 test('known working paid account ranks before an untested normal account', () => {
  const p=Object.create(Policy.prototype);p.scanner={get:i=>({state:i===0?'ready-paid':'ready-free'}),fingerprint:i=>'fp'+i};p.modelEvidence={};p.persist=()=>{};p.noteSuccess(0,'new-model');assert.ok(p.rank(0,'new-model')<p.rank(1,'new-model'));
 });
+
+test('a standard-account refusal restricts the model group temporarily and success clears it', () => {
+ const p=Object.create(Policy.prototype);p.scanner={get:i=>({state:i===0?'ready-paid':'ready-free'}),fingerprint:i=>'fp'+i};p.modelEvidence={};p.groupEvidence={};p.persist=()=>{};
+ p.noteDenied(1,'future-model');p.markGroupDenied('normal','future-model',600000);
+ assert.equal(p.groupDenied('normal','future-model'),true);
+ assert.equal(p.groupDenied('paid','future-model'),false);
+ p.noteSuccess(0,'future-model');
+ assert.equal(p.groupDenied('normal','future-model'),true,'paid success must not clear the standard-group learning');
+ p.noteSuccess(1,'future-model');
+ assert.equal(p.groupDenied('normal','future-model'),false,'standard success clears the restriction');
+});
+test('group restriction expires and unknown models stay unrestricted', () => {
+ const p=Object.create(Policy.prototype);p.scanner={get:()=>({state:'ready-free'}),fingerprint:i=>'fp'+i};p.modelEvidence={};p.groupEvidence={};p.persist=()=>{};
+ assert.equal(p.groupDenied('normal','never-seen'),false);
+ p.groupEvidence['m']={normal:Date.now()-1};
+ assert.equal(p.groupDenied('normal','m'),false);
+});

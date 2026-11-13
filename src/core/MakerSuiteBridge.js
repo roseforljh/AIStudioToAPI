@@ -622,7 +622,7 @@ class MakerSuiteBridge {
                 throw Object.assign(new Error("Invalid Gemini JSON in MakerSuite generation request"), { status: 400 });
             }
             if (hasBodyAttempt) delete g[ATTEMPT_FIELD];
-            const { body, ht } = buildBody(match[1], g);
+            const { body, ht, toolNames } = buildBody(match[1], g);
             const expectedDocumentId = this.benefit
                 ? await this.benefit._evaluate(() => window.__buildBenefit?.documentId)
                 : null;
@@ -685,7 +685,7 @@ class MakerSuiteBridge {
                 );
                 return await fulfill(normalized);
             }
-            const response = wrapResponse(result.text, streamed);
+            const response = wrapResponse(result.text, streamed, toolNames);
             await fulfill({ body: response, status: 200 });
             this.logger.debug(`[MakerSuite] account #${this.authIndex}: generation completed`);
         } catch (error) {
@@ -694,7 +694,8 @@ class MakerSuiteBridge {
                 const status = error.status || 502;
                 const message = error.status ? error.message : "MakerSuite bridge request failed";
                 // Keep the protobuf RPC Status shape expected by the Studio client.
-                let body = JSON.stringify(error.rpcStatus || [status === 400 ? 3 : 13, message]);
+                const rpcCode = { 400: 3, 401: 16, 403: 7, 404: 5, 429: 8, 503: 14, 504: 4 }[status] || 13;
+                let body = JSON.stringify(error.rpcStatus || [rpcCode, message]);
                 if (status === 401) {
                     const state = await this.diagnoseAuth(invalidated);
                     if (invalid || this.closed || epoch !== this.epoch) return;
