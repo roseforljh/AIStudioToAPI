@@ -394,31 +394,32 @@ class ConnectionRegistry extends EventEmitter {
             }
             // Remove from map immediately (the close event will also trigger _removeConnection)
             this.connectionsByAuth.delete(authIndex);
-
-            // Clear any grace timers for this account
-            if (this.reconnectGraceTimers.has(authIndex)) {
-                clearTimeout(this.reconnectGraceTimers.get(authIndex));
-                this.reconnectGraceTimers.delete(authIndex);
-            }
-
-            // Clear reconnecting status for this account
-            if (this.reconnectingAccounts.has(authIndex)) {
-                this.reconnectingAccounts.delete(authIndex);
-                this.logger.debug(`[Registry] Cleared reconnecting status for authIndex=${authIndex}`);
-            }
-
-            // Clear lightweight reconnect timeout for this account
-            if (this.lightweightReconnectTimeouts.has(authIndex)) {
-                const { timeoutId, timeoutReject } = this.lightweightReconnectTimeouts.get(authIndex);
-                clearTimeout(timeoutId);
-                if (timeoutReject) {
-                    timeoutReject(new ReconnectCancelledError("Connection closed manually, reconnect cancelled"));
-                }
-                this.lightweightReconnectTimeouts.delete(authIndex);
-                this.logger.debug(`[Registry] Cleared lightweight reconnect timeout for authIndex=${authIndex}`);
-            }
         } else {
             this.logger.debug(`[Registry] No WebSocket connection to close for authIndex=${authIndex}`);
+        }
+
+        // Disconnected accounts can still own reconnect timers.
+        // Clear any grace timers for this account
+        if (this.reconnectGraceTimers.has(authIndex)) {
+            clearTimeout(this.reconnectGraceTimers.get(authIndex));
+            this.reconnectGraceTimers.delete(authIndex);
+        }
+
+        // Clear reconnecting status for this account
+        if (this.reconnectingAccounts.has(authIndex)) {
+            this.reconnectingAccounts.delete(authIndex);
+            this.logger.debug(`[Registry] Cleared reconnecting status for authIndex=${authIndex}`);
+        }
+
+        // Clear lightweight reconnect timeout for this account
+        if (this.lightweightReconnectTimeouts.has(authIndex)) {
+            const { timeoutId, timeoutReject } = this.lightweightReconnectTimeouts.get(authIndex);
+            clearTimeout(timeoutId);
+            if (timeoutReject) {
+                timeoutReject(new ReconnectCancelledError("Connection closed manually, reconnect cancelled"));
+            }
+            this.lightweightReconnectTimeouts.delete(authIndex);
+            this.logger.debug(`[Registry] Cleared lightweight reconnect timeout for authIndex=${authIndex}`);
         }
     }
 

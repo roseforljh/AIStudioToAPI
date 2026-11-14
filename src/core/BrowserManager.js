@@ -1744,7 +1744,11 @@ class BrowserManager {
         if (!this.pendingContextClosures.has(authIndex)) {
             return false;
         }
-        if (authIndex === this._currentAuthIndex && !this.isAccountDeprioritized(authIndex)) {
+        if (
+            !this.config.accountLoadBalancing &&
+            authIndex === this._currentAuthIndex &&
+            !this.isAccountDeprioritized(authIndex)
+        ) {
             this.logger.debug(`[ContextPool] Skipping pending close for healthy current context #${authIndex}.`);
             return false;
         }
@@ -2058,6 +2062,15 @@ class BrowserManager {
             const until = Date.now() + ms;
             if ((this._deprioritizedUntil.get(authIndex) || 0) >= until) return;
             this._deprioritizedUntil.set(authIndex, until);
+            // Retire once from admission immediately; queue drain still controls resource cleanup.
+            this._poolActive.delete(authIndex);
+            try {
+                this.accountRoutingPolicy?.retire(authIndex, this.authSource.getRotationIndices());
+            } catch (error) {
+                this.logger.warn(`[ContextPool] Could not save retirement order: ${error.message}`);
+            }
+            if (this.initializingContexts.has(authIndex)) this.abortedContexts.add(authIndex);
+            if (this.contexts.has(authIndex)) this._scheduleContextClosureWhenIdle(authIndex, "account_retired");
             this.logger.info(
                 `[ContextPool] Account #${authIndex} deprioritized for ${Math.round(ms / 1000)}s (limit/cooldown) - pool will backfill with fresh accounts.`
             );
@@ -2096,7 +2109,7 @@ class BrowserManager {
             this.rebalanceContextPool().catch(err => {
                 this.logger.error(`[ContextPool] Backfill rebalance failed: ${err.message}`);
             });
-        }, 5000);
+        }, 0);
         if (this._deprioritizeRebuildTimer.unref) this._deprioritizeRebuildTimer.unref();
     }
 
@@ -2151,6 +2164,7 @@ class BrowserManager {
     }
 
     _isAccountUnavailable(idx) {
+        if (this.pendingContextClosures.has(idx)) return true;
         if (this.contextMaintenance?.maintenanceIndices.has(idx)) return true;
         try {
             if (this._accountAvailabilityChecker && this._accountAvailabilityChecker(idx)) return true;
@@ -2213,6 +2227,7 @@ class BrowserManager {
         const stale = [...this.contexts.keys()].filter(
             i =>
                 !valid.has(this.authSource.getCanonicalIndex(i) ?? i) ||
+                this.pendingContextClosures.has(i) ||
                 this.isAccountDeprioritized(i) ||
                 (targetSet && !targetSet.has(i))
         );
@@ -2373,6 +2388,9 @@ class BrowserManager {
             this.accountHealth.clear(authIndex);
             return result;
         } catch (error) {
+            if (this.config?.accountLoadBalancing && !isContextAbortedError(error)) {
+                this.deprioritizeAccount(authIndex, 30000);
+            }
             this.accountHealth.record(authIndex, error, {
                 aborted: isContextAbortedError(error),
                 expired: isAuthExpiredError(error),
@@ -2991,6 +3009,10 @@ class BrowserManager {
         // _removeConnection will see that the context is already gone and skip reconnect logic
         this.contexts.delete(authIndex);
         this._contextLifecycle.delete(authIndex);
+        this._wsInitState.delete(authIndex);
+        this._poolActive.delete(authIndex);
+        contextData.page?.makerSuiteBridge?.dispose();
+        contextData.page?.buildBenefit?.dispose();
 
         // Proactively close message queues BEFORE closing context to prevent race condition
         // Race condition: context.close() triggers async WebSocket 'close' event, which calls _removeConnection()
@@ -3024,6 +3046,8 @@ class BrowserManager {
         } catch (e) {
             this.logger.warn(`[Browser] Error closing context #${authIndex}: ${e.message}`);
         }
+
+        this.connectionRegistry?.closeConnectionByAuth(authIndex);
 
         // If this was the last context, close the browser to free resources
         // This ensures a clean state when all accounts are deleted

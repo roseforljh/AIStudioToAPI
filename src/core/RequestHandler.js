@@ -86,6 +86,9 @@ class RequestHandler {
                 const cfg = Number(config.accountMaxConcurrentRequestsTotal);
                 return Number.isFinite(cfg) && cfg > 0 ? Math.min(active, cfg) : active;
             },
+            onCooldown: (index, durationMs) => {
+                if (config.accountLoadBalancing) this.browserManager.deprioritizeAccount?.(index, durationMs);
+            },
             onRequestFinished: index => this.browserManager.touchContext?.(index),
         });
         // PATCH(active/standby split): let the pool know which accounts are temporarily
@@ -762,7 +765,7 @@ class RequestHandler {
         }
     }
 
-    async _moveCurrentAccountLease(errorDetails, attemptedAuthIndices) {
+    async _moveCurrentAccountLease(errorDetails, attemptedAuthIndices, requestId = null) {
         const lease = this.accountRequestContext.getLease();
         if (!lease) return false;
         // PATCH(upload-affinity): 上传会话 / 文件所属账号是唯一正确的账号，禁止换号。
@@ -784,6 +787,14 @@ class RequestHandler {
             this.serverSystem.accountRoutingPolicy?.markUnsupported(sourceAuthIndex, model);
         }
         attemptedAuthIndices.add(sourceAuthIndex);
+        // The cancelled attempt cannot keep the old context busy while we wait for backfill.
+        if (requestId && this.connectionRegistry.getAuthIndexForRequest(requestId) === sourceAuthIndex) {
+            this.connectionRegistry.removeMessageQueue(requestId, "retry_account_retired");
+        }
+        // Statuses without a configured cooldown still retire when we abandon the account.
+        if (!this.accountLoadBalancer.cooldownByStatus.has(Number(errorDetails?.status))) {
+            this.accountLoadBalancer.markCooldown(sourceAuthIndex, Number(errorDetails?.status), 15000);
+        }
         await lease.move({
             exclude: attemptedAuthIndices,
             failFast: Number(errorDetails?.status) === 403,
@@ -1303,20 +1314,6 @@ class RequestHandler {
             const status = Number(errorDetails?.status);
             if (this.config.immediateSwitchStatusCodes.includes(status)) {
                 this.accountLoadBalancer.markCooldown(this.currentAuthIndex, status);
-                // PATCH(balance+backfill): also deprioritize this account so the pool
-                // swaps in a fresh one instead of staying on a limited account.
-                try {
-                    let ms = 300000;
-                    const map = this.accountLoadBalancer && this.accountLoadBalancer.cooldownByStatus;
-                    if (map && typeof map.get === "function") {
-                        ms = map.get(status) || map.get(String(status)) || ms;
-                    }
-                    if (this.browserManager && typeof this.browserManager.deprioritizeAccount === "function") {
-                        this.browserManager.deprioritizeAccount(this.currentAuthIndex, ms);
-                    }
-                } catch (e) {
-                    this.logger.warn(`[LoadBalancer] deprioritize after ${status} failed: ${e.message}`);
-                }
             }
             return;
         }
@@ -1333,7 +1330,7 @@ class RequestHandler {
                 return false;
             }
             try {
-                return await this._moveCurrentAccountLease(errorDetails, tracker.attemptedAuthIndices);
+                return await this._moveCurrentAccountLease(errorDetails, tracker.attemptedAuthIndices, requestId);
             } catch (error) {
                 this.logger.warn(
                     `[LoadBalancer] No alternative account available for request #${requestId}: ${error.message}`
@@ -4146,9 +4143,6 @@ class RequestHandler {
                     break;
                 }
 
-                if (this.config.accountLoadBalancing && this.accountRequestContext.getLease()) {
-                    this.accountLoadBalancer.markCooldown(currentQueueAuthIndex, 504, 15000);
-                }
                 lastError = errorPayload;
                 this._cancelCurrentAttemptBeforeRetry(proxyRequest, currentQueueAuthIndex);
 
@@ -4189,7 +4183,8 @@ class RequestHandler {
                     try {
                         const moved = await this._moveCurrentAccountLease(
                             errorPayload,
-                            immediateSwitchTracker.attemptedAuthIndices
+                            immediateSwitchTracker.attemptedAuthIndices,
+                            proxyRequest.request_id
                         );
                         const nextIndex = this.accountRequestContext.getLease()?.authIndex;
                         if (!moved || !Number.isInteger(nextIndex) || nextIndex === currentQueueAuthIndex) {
@@ -4264,7 +4259,8 @@ class RequestHandler {
                             try {
                                 const moved = await this._moveCurrentAccountLease(
                                     errorPayload,
-                                    immediateSwitchTracker.attemptedAuthIndices
+                                    immediateSwitchTracker.attemptedAuthIndices,
+                                    proxyRequest.request_id
                                 );
                                 const nextIndex = this.accountRequestContext.getLease()?.authIndex;
                                 if (moved && Number.isInteger(nextIndex) && nextIndex !== currentQueueAuthIndex) {
@@ -4334,7 +4330,8 @@ class RequestHandler {
                             ? false
                             : await this._moveCurrentAccountLease(
                                   errorPayload,
-                                  immediateSwitchTracker.attemptedAuthIndices
+                                  immediateSwitchTracker.attemptedAuthIndices,
+                                  proxyRequest.request_id
                               );
                         if (moved || isPinnedRequest) {
                             const newAuthIndex = isPinnedRequest
