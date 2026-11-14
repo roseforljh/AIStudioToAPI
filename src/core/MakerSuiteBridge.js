@@ -767,6 +767,7 @@ class MakerSuiteBridge {
             const deferredTools = new Map();
             const terminal = { candidates: [] };
             let outputStarted = false;
+            let pendingMetadata = "";
             const decoder = new PlaygroundStreamDecoder(
                 chunk => {
                     if (invalid || this.closed || epoch !== this.epoch) return;
@@ -805,6 +806,15 @@ class MakerSuiteBridge {
                         output.candidates?.some(c => c.content?.parts?.length > 0 || c.groundingMetadata) ||
                         output.promptFeedback
                     ) {
+                        // Metadata alone must not commit HTTP 200 and disable safe retries.
+                        if (!headersSent && !hasCandidatesContent(output.candidates)) {
+                            pendingMetadata += `data: ${JSON.stringify(output)}\n\n`;
+                            if (pendingMetadata.length > decoder.maxMessageChars)
+                                throw Object.assign(new Error("MakerSuite metadata exceeds size limit"), {
+                                    status: 502,
+                                });
+                            return;
+                        }
                         if (!headersSent) {
                             onEvent({
                                 event_type: "response_headers",
@@ -812,6 +822,8 @@ class MakerSuiteBridge {
                                 status: 200,
                             });
                             headersSent = true;
+                            if (pendingMetadata) onEvent({ data: pendingMetadata, event_type: "chunk" });
+                            pendingMetadata = "";
                         }
                         onEvent({
                             data: `data: ${JSON.stringify(output)}\n\n`,
@@ -878,6 +890,7 @@ class MakerSuiteBridge {
                 });
                 headersSent = true;
             }
+            if (pendingMetadata) onEvent({ data: pendingMetadata, event_type: "chunk" });
             if (tools) onEvent({ data: `data: ${JSON.stringify(tools)}\n\n`, event_type: "chunk" });
             terminal.candidates = [...finishes.values()];
             onEvent({

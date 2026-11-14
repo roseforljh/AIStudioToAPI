@@ -462,3 +462,32 @@ test("HTTP stream heartbeat stops on both normal finish and client close", () =>
     stop2();
     assert.equal(res.listenerCount("finish"), 0);
 });
+
+test("metadata and empty parts cannot commit HTTP success before a code-19 empty failure", async t => {
+    const signature = Array(15).fill(null);
+    signature[14] = "metadata-only-signature";
+    const { bridge } = createStreamBridgeFixture(t, async () =>
+        responseFromBlocks([JSON.stringify([frameOf([[null, ""], signature]), frameOf([], 19)])])
+    );
+    const events = [];
+    await bridge.streamRequest(streamSpec("metadata-empty"), e => events.push(e));
+    assert.deepEqual(
+        events.map(e => e.event_type),
+        ["error"]
+    );
+    assert.equal(events[0].status, 503);
+    assert.match(events[0].message, /code=19/);
+});
+
+test("metadata-only malformed completion remains a retryable 502 before headers", async t => {
+    const { bridge } = createStreamBridgeFixture(t, async () =>
+        responseFromBlocks([JSON.stringify([frameOf([[null, ""]])])])
+    );
+    const events = [];
+    await bridge.streamRequest(streamSpec("metadata-unfinished"), e => events.push(e));
+    assert.deepEqual(
+        events.map(e => e.event_type),
+        ["error"]
+    );
+    assert.equal(events[0].status, 502);
+});

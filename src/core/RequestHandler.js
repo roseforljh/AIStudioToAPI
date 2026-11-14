@@ -741,7 +741,7 @@ class RequestHandler {
                 }
             };
             res.once("finish", recordResult);
-            return await this.accountRequestContext.run({ lease, model }, callback);
+            return await this.accountRequestContext.run({ lease, model, signal: controller.signal }, callback);
         } catch (error) {
             if (!res.headersSent && !res.writableEnded) {
                 if (error.name === "AbortError") return;
@@ -765,7 +765,7 @@ class RequestHandler {
         }
     }
 
-    async _moveCurrentAccountLease(errorDetails, attemptedAuthIndices, requestId = null) {
+    async _moveCurrentAccountLease(errorDetails, attemptedAuthIndices, requestId = null, acquireOptions = {}) {
         const lease = this.accountRequestContext.getLease();
         if (!lease) return false;
         // PATCH(upload-affinity): 上传会话 / 文件所属账号是唯一正确的账号，禁止换号。
@@ -786,6 +786,7 @@ class RequestHandler {
         ) {
             this.serverSystem.accountRoutingPolicy?.markUnsupported(sourceAuthIndex, model);
         }
+        this._recordAccountModelDenial(errorDetails, sourceAuthIndex);
         attemptedAuthIndices.add(sourceAuthIndex);
         // The cancelled attempt cannot keep the old context busy while we wait for backfill.
         if (requestId && this.connectionRegistry.getAuthIndexForRequest(requestId) === sourceAuthIndex) {
@@ -796,6 +797,7 @@ class RequestHandler {
             this.accountLoadBalancer.markCooldown(sourceAuthIndex, Number(errorDetails?.status), 15000);
         }
         await lease.move({
+            ...acquireOptions,
             exclude: attemptedAuthIndices,
             failFast: Number(errorDetails?.status) === 403,
             release: { status: Number(errorDetails?.status) },
@@ -1240,7 +1242,12 @@ class RequestHandler {
         const pinnedFromLease = this.accountRequestContext.getLease?.()?.pinnedAuthIndex;
         const pinnedAuthIndex =
             pinnedFromOption !== null ? pinnedFromOption : Number.isInteger(pinnedFromLease) ? pinnedFromLease : null;
-        return { attemptedAuthIndices, pinnedAuthIndex };
+        return {
+            attemptedAuthIndices,
+            attemptLimit: this._getRequestAttemptLimit(),
+            deadline: Date.now() + this._loadBalancerTimeouts().total,
+            pinnedAuthIndex,
+        };
     }
 
     /**
@@ -1266,7 +1273,7 @@ class RequestHandler {
 
     _shouldRetryUpstreamStatus(status, errorDetails = null) {
         return (
-            Number(status) === 404 ||
+            [403, 404, 502, 504].includes(Number(status)) ||
             this._isOpaqueUpstream400(errorDetails || { status }) ||
             Boolean(this.config?.immediateSwitchStatusCodes?.includes(Number(status)))
         );
@@ -1294,7 +1301,18 @@ class RequestHandler {
         return `immediate_status_retry_${status}`;
     }
 
+    _recordAccountModelDenial(errorDetails, authIndex) {
+        const model = this.accountRequestContext.getStore?.()?.model;
+        if (Number(errorDetails?.status) !== 403 || !model) return;
+        try {
+            this.serverSystem.accountRoutingPolicy?.noteDenied(authIndex, model);
+        } catch (error) {
+            this.logger.warn(`[Routing] Could not save account/model refusal: ${error.name}`);
+        }
+    }
+
     async _handleRequestFailure(errorDetails, sendErrorCallback = null) {
+        if (isUserAbortedError(errorDetails)) return;
         const requestStore = this.accountRequestContext.getStore();
         const errorMessage = String(errorDetails?.message || "");
         if (
@@ -1312,8 +1330,10 @@ class RequestHandler {
         if (Number(errorDetails?.status) === 404) return;
         if (this.config.accountLoadBalancing && this.accountRequestContext.getLease()) {
             const status = Number(errorDetails?.status);
-            if (this.config.immediateSwitchStatusCodes.includes(status)) {
-                this.accountLoadBalancer.markCooldown(this.currentAuthIndex, status);
+            this._recordAccountModelDenial(errorDetails, this.currentAuthIndex);
+            if ([403, 502, 504].includes(status) || this.config.immediateSwitchStatusCodes?.includes(status)) {
+                const duration = this.accountLoadBalancer.cooldownByStatus.get(status) || 15000;
+                this.accountLoadBalancer.markCooldown(this.currentAuthIndex, status, duration);
             }
             return;
         }
@@ -1330,7 +1350,10 @@ class RequestHandler {
                 return false;
             }
             try {
-                return await this._moveCurrentAccountLease(errorDetails, tracker.attemptedAuthIndices, requestId);
+                return await this._moveCurrentAccountLease(errorDetails, tracker.attemptedAuthIndices, requestId, {
+                    signal: this.accountRequestContext.getStore?.()?.signal,
+                    timeoutMs: Math.max(1, tracker.deadline - Date.now()),
+                });
             } catch (error) {
                 this.logger.warn(
                     `[LoadBalancer] No alternative account available for request #${requestId}: ${error.message}`
@@ -1384,12 +1407,24 @@ class RequestHandler {
     }
 
     async _prepareImmediateStatusRetry(errorDetails, requestId, tracker, sourceAuthIndex) {
+        const store = this.accountRequestContext.getStore?.();
+        if (store?.signal?.aborted || isUserAbortedError(errorDetails)) return false;
+        if (Date.now() >= tracker.deadline) {
+            await this._handleRequestFailure(errorDetails);
+            this.logger.warn(`[Request] Retry deadline reached for #${requestId}; returning upstream error.`);
+            return false;
+        }
         if (Number(errorDetails?.status) === 404) {
             return this._prepareTransient404Retry(errorDetails, requestId, tracker);
         }
         if (this._isOpaqueUpstream400(errorDetails)) {
             const retried = await this._prepareTransient400Retry(errorDetails, requestId, tracker);
             if (retried) return true;
+        }
+        if (this._isPinnedRequest(tracker) || tracker.attemptedAuthIndices.size >= tracker.attemptLimit) {
+            await this._handleRequestFailure(errorDetails);
+            this.logger.warn(`[Request] No further account retries allowed for #${requestId}.`);
+            return false;
         }
         const currentAuthIndex = this.currentAuthIndex;
         const hasSourceAuth = Number.isInteger(sourceAuthIndex) && sourceAuthIndex >= 0;
@@ -1952,7 +1987,9 @@ class RequestHandler {
                             this._getAccountNameForIndex(currentQueueAuthIndex)
                         );
                         this._forwardRequest(proxyRequest, currentQueueAuthIndex);
-                        initialMessage = await currentQueue.dequeue();
+                        initialMessage = await currentQueue.dequeue(
+                            Math.max(1, immediateSwitchTracker.deadline - Date.now())
+                        );
 
                         const initialStatus = Number(initialMessage?.status);
                         if (
@@ -2360,7 +2397,9 @@ class RequestHandler {
                             this._getAccountNameForIndex(currentQueueAuthIndex)
                         );
                         this._forwardRequest(proxyRequest, currentQueueAuthIndex);
-                        initialMessage = await currentQueue.dequeue();
+                        initialMessage = await currentQueue.dequeue(
+                            Math.max(1, immediateSwitchTracker.deadline - Date.now())
+                        );
 
                         const initialStatus = Number(initialMessage?.status);
                         if (
@@ -2737,7 +2776,9 @@ class RequestHandler {
                             this._getAccountNameForIndex(currentQueueAuthIndex)
                         );
                         this._forwardRequest(proxyRequest, currentQueueAuthIndex);
-                        initialMessage = await currentQueue.dequeue();
+                        initialMessage = await currentQueue.dequeue(
+                            Math.max(1, immediateSwitchTracker.deadline - Date.now())
+                        );
 
                         const initialStatus = Number(initialMessage?.status);
                         if (
@@ -3297,7 +3338,9 @@ class RequestHandler {
 
                 if (message.event_type === "error") {
                     this.logger.error(`❌ [Request] Error received during Claude stream: ${message.message}`);
-                    this._markTrackedResponseError(res, message.message, 500);
+                    const status = Number(message.status) || 502;
+                    this._markTrackedResponseError(res, message.message, status);
+                    await this._handleRequestFailure(message);
                     // Attempt to send error event to client if headers allowed, then close
                     // Check if response is still writable before attempting to write
                     if (this._isResponseWritable(res)) {
@@ -3692,7 +3735,7 @@ class RequestHandler {
                 this._getAccountNameForIndex(currentQueueAuthIndex)
             );
             this._forwardRequest(proxyRequest, currentQueueAuthIndex);
-            headerMessage = await currentQueue.dequeue();
+            headerMessage = await currentQueue.dequeue(Math.max(1, immediateSwitchTracker.deadline - Date.now()));
 
             const headerStatus = Number(headerMessage?.status);
             if (
@@ -3792,12 +3835,14 @@ class RequestHandler {
 
                 if (dataMessage.event_type === "error") {
                     this.logger.error(`❌ [Request] Error received during Gemini real stream: ${dataMessage.message}`);
-                    this._markTrackedResponseError(res, dataMessage.message, 500);
+                    const status = Number(dataMessage.status) || 502;
+                    this._markTrackedResponseError(res, dataMessage.message, status);
+                    await this._handleRequestFailure(dataMessage);
                     // Check if response is still writable before attempting to write
                     if (this._isResponseWritable(res)) {
                         try {
                             res.write(
-                                `data: ${JSON.stringify({ error: { code: 500, message: dataMessage.message, status: "INTERNAL" } })}\n\n`
+                                `data: ${JSON.stringify({ error: { code: status, message: dataMessage.message, status: status === 503 ? "UNAVAILABLE" : "INTERNAL" } })}\n\n`
                             );
                         } catch (writeError) {
                             this.logger.debug(
@@ -4150,24 +4195,7 @@ class RequestHandler {
                 // 403 is an upstream rejection, not proof of subscription tier. Temporarily
                 // avoid this account/model pair and never replay it on the same account.
                 if (errorStatus === 403 && proxyRequest.is_generative && !isUserAbortedError(errorPayload)) {
-                    const modelName = this._extractModelFromPath(proxyRequest.path);
-                    if (modelName && Number.isInteger(currentQueueAuthIndex)) {
-                        try {
-                            this.serverSystem.accountRoutingPolicy?.noteDenied(currentQueueAuthIndex, modelName);
-                            // A standard account refused this model while a paid group exists:
-                            // remember the restriction briefly instead of probing every standard
-                            // account again for every new request.
-                            const routing = this.serverSystem.accountRoutingPolicy;
-                            if (routing && routing.group(currentQueueAuthIndex) === "normal") {
-                                const hasPaid = [...this.connectionRegistry.getAllConnections().entries()].some(
-                                    ([idx, c]) => c?.readyState === 1 && routing.group(idx) === "paid"
-                                );
-                                if (hasPaid) routing.markGroupDenied("normal", modelName, 600000);
-                            }
-                        } catch (e) {
-                            this.logger.warn(`[Routing] Unable to save model cooldown: ${e.name}`);
-                        }
-                    }
+                    this._recordAccountModelDenial(errorPayload, currentQueueAuthIndex);
                     if (
                         this._isPinnedRequest(immediateSwitchTracker) ||
                         !this.config.accountLoadBalancing ||
@@ -4373,7 +4401,7 @@ class RequestHandler {
                 // Check if we should stop retrying immediately based on status code
                 if (
                     Number.isFinite(errorStatus) &&
-                    this.config?.immediateSwitchStatusCodes?.includes(errorStatus) &&
+                    (errorStatus === 502 || this.config?.immediateSwitchStatusCodes?.includes(errorStatus)) &&
                     !isUserAbortedError(errorPayload)
                 ) {
                     this.logger.warn(`[Request] Received ${errorStatus}, preparing retry...`);
@@ -4500,7 +4528,9 @@ class RequestHandler {
 
                 if (message.event_type === "error") {
                     this.logger.error(`❌ [Request] Error received during Response API stream: ${message.message}`);
-                    this._markTrackedResponseError(res, message.message, 500);
+                    const status = Number(message.status) || 502;
+                    this._markTrackedResponseError(res, message.message, status);
+                    await this._handleRequestFailure(message);
                     if (this._isResponseWritable(res)) {
                         try {
                             if (!streamState.sequenceNumber) streamState.sequenceNumber = 0;
@@ -4591,13 +4621,15 @@ class RequestHandler {
 
                 if (message.event_type === "error") {
                     this.logger.error(`❌ [Request] Error received during OpenAI stream: ${message.message}`);
-                    this._markTrackedResponseError(res, message.message, 500);
+                    const status = Number(message.status) || 502;
+                    this._markTrackedResponseError(res, message.message, status);
+                    await this._handleRequestFailure(message);
                     // Attempt to send error event to client if headers allowed, then close
                     // Check if response is still writable before attempting to write
                     if (this._isResponseWritable(res)) {
                         try {
                             res.write(
-                                `data: ${JSON.stringify({ error: { code: 500, message: message.message, type: "api_error" } })}\n\n`
+                                `data: ${JSON.stringify({ error: { code: status, message: message.message, type: "api_error" } })}\n\n`
                             );
                         } catch (writeError) {
                             this.logger.debug(
