@@ -256,3 +256,77 @@ test("closing a retired disconnected context also clears outstanding reconnect t
     assert.equal(registry.lightweightReconnectTimeouts.has(0), false);
     assert.equal(cancelled, true);
 });
+
+test("403-model refusals in a recovered warm window cannot starve untried cold accounts", async t => {
+    const { manager: b, policy, busy } = fixture(t);
+    policy.noteDenied(0, "hydrogen");
+    policy.noteDenied(1, "hydrogen");
+    busy.add(1);
+    const clear = b.prioritizeRetryCandidates("waiting-request", i => !policy.blocked(i, "hydrogen"));
+    await b.rebalanceContextPool();
+    assert.equal(b.contexts.has(0), false);
+    assert.equal(b.contexts.has(1), true, "another request's busy context must not be closed");
+    assert.equal(b.contexts.has(2), true, "untried cold account fills the freed slot");
+    assert.deepEqual(b.selectActiveAuthIndices([1, 2].filter(i => !policy.blocked(i, "hydrogen"))), [2]);
+    clear();
+    assert.equal(b._retryCandidates.size, 0);
+});
+
+test("retry candidate promotion preserves paid/free quotas and concurrent waiter cleanup", async t => {
+    const { manager: b, policy, connect } = fixture(t, [0, 1, 2, 3, 10, 11, 12, 13]);
+    policy.settings = { normalActive: 1, normalStandby: 1, paidActive: 1, paidStandby: 1 };
+    b.config.maxContexts = 4;
+    connect(10);
+    connect(11);
+    const clearNormal = b.prioritizeRetryCandidates("normal-waiter", i => i === 2 || i === 3);
+    const clearPaid = b.prioritizeRetryCandidates("paid-waiter", i => i === 12 || i === 13);
+    await b.rebalanceContextPool();
+    assert.deepEqual(new Set(b.contexts.keys()), new Set([2, 3, 12, 13]));
+    assert.deepEqual(b.getActiveCallableIndices(), [12, 2]);
+    clearNormal();
+    assert.equal(b._retryCandidates.size, 1);
+    assert.ok(b._retryCandidates.has("paid-waiter"));
+    clearPaid();
+    assert.equal(b._retryCandidates.size, 0);
+});
+
+test("403 single-slot backfill waits for a cold account and clears retry preference", async t => {
+    const { manager: b, connections, policy } = fixture(t);
+    const Registry = require("../src/core/ConnectionRegistry");
+    const registry = new Registry(logger, null, null, b);
+    registry.connectionsByAuth = connections;
+    b.setConnectionRegistry(registry);
+    await b.closeContext(1);
+    b.config.maxContexts = 1;
+    policy.settings.normalStandby = 0;
+    b._scheduleDeprioritizeRebuild = BrowserManager.prototype._scheduleDeprioritizeRebuild.bind(b);
+    t.after(() => clearTimeout(b._deprioritizeRebuildTimer));
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "cold-403-retry-"));
+    const cwd = process.cwd();
+    let h;
+    try {
+        process.chdir(directory);
+        h = new RequestHandler(
+            { accountRoutingPolicy: policy },
+            registry,
+            logger,
+            b,
+            { accountLoadBalancing: true, maxRetries: 1 },
+            b.authSource
+        );
+    } finally {
+        process.chdir(cwd);
+        fs.rmSync(directory, { force: true, recursive: true });
+    }
+    const lease = await h.accountLoadBalancer.acquire();
+    registry.createMessageQueue("cold-403", 0, "attempt-1");
+    await h.accountRequestContext.run({ lease, model: "hydrogen" }, async () => {
+        const tracker = h._createImmediateSwitchTracker(0);
+        tracker.deadline = Date.now() + 1000;
+        assert.equal(await h._prepareImmediateStatusRetry({ status: 403 }, "cold-403", tracker, 0), true);
+    });
+    assert.equal(lease.authIndex, 1);
+    assert.equal(policy.blocked(0, "hydrogen"), true);
+    assert.equal(b._retryCandidates.size, 0);
+    lease.release();
+});

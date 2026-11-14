@@ -799,7 +799,7 @@ class RequestHandler {
         await lease.move({
             ...acquireOptions,
             exclude: attemptedAuthIndices,
-            failFast: Number(errorDetails?.status) === 403,
+            failFast: false,
             release: { status: Number(errorDetails?.status) },
         });
         attemptedAuthIndices.add(lease.authIndex);
@@ -1226,11 +1226,13 @@ class RequestHandler {
     _getRequestAttemptLimit() {
         const configured = Math.max(1, Number(this.config?.maxRetries) || 1);
         if (!this.config?.accountLoadBalancing) return configured;
+        // Warm/active slots are capacity limits, not the inventory available for failover.
         const eligibleAccounts =
+            this.authSource?.getRotationIndices?.().length ??
             this.accountLoadBalancer?.getEligibleAuthIndices?.().length ??
             this.accountLoadBalancer?.getSnapshot?.()?.accounts?.length ??
             0;
-        return Math.min(30, Math.max(configured, eligibleAccounts));
+        return Math.max(configured, eligibleAccounts);
     }
 
     _createImmediateSwitchTracker(initialAuthIndex = this.currentAuthIndex, options = {}) {
@@ -1349,9 +1351,24 @@ class RequestHandler {
                 );
                 return false;
             }
+            const store = this.accountRequestContext.getStore?.();
+            const policy = this.serverSystem.accountRoutingPolicy;
+            const allowed = index =>
+                !tracker.attemptedAuthIndices.has(index) &&
+                (!store?.model ||
+                    !policy ||
+                    (!policy.blocked(index, store.model) && !policy.groupDenied(policy.group(index), store.model)));
+            const inventory = this.authSource?.getRotationIndices?.();
+            if (inventory && !inventory.some(allowed)) {
+                await this._handleRequestFailure(errorDetails);
+                this.logger.warn(`[LoadBalancer] All eligible accounts exhausted for request #${requestId}.`);
+                return false;
+            }
+            const clearRetryCandidates = this.browserManager?.prioritizeRetryCandidates?.(requestId, allowed);
             try {
                 return await this._moveCurrentAccountLease(errorDetails, tracker.attemptedAuthIndices, requestId, {
-                    signal: this.accountRequestContext.getStore?.()?.signal,
+                    allowed,
+                    signal: store?.signal,
                     timeoutMs: Math.max(1, tracker.deadline - Date.now()),
                 });
             } catch (error) {
@@ -1359,6 +1376,8 @@ class RequestHandler {
                     `[LoadBalancer] No alternative account available for request #${requestId}: ${error.message}`
                 );
                 return false;
+            } finally {
+                clearRetryCandidates?.();
             }
         }
 
@@ -4065,6 +4084,7 @@ class RequestHandler {
             );
         let retryAttempt = 1;
         const immediateSwitchTracker = this._createImmediateSwitchTracker(currentQueueAuthIndex);
+        if (totalDeadline !== null) immediateSwitchTracker.deadline = totalDeadline;
 
         const requestAttemptLimit = this._getRequestAttemptLimit();
 
@@ -4204,15 +4224,12 @@ class RequestHandler {
                         lastError = { ...errorPayload, skipAccountSwitch: true };
                         break;
                     }
-                    if (retryAttempt >= requestAttemptLimit) {
-                        lastError = { ...errorPayload, skipAccountSwitch: true };
-                        break;
-                    }
                     try {
-                        const moved = await this._moveCurrentAccountLease(
+                        const moved = await this._prepareImmediateStatusRetry(
                             errorPayload,
-                            immediateSwitchTracker.attemptedAuthIndices,
-                            proxyRequest.request_id
+                            proxyRequest.request_id,
+                            immediateSwitchTracker,
+                            currentQueueAuthIndex
                         );
                         const nextIndex = this.accountRequestContext.getLease()?.authIndex;
                         if (!moved || !Number.isInteger(nextIndex) || nextIndex === currentQueueAuthIndex) {
@@ -4285,10 +4302,10 @@ class RequestHandler {
                         ) {
                             immediateSwitchTracker.transient400Switched = true;
                             try {
-                                const moved = await this._moveCurrentAccountLease(
+                                const moved = await this._performImmediateSwitchRetry(
                                     errorPayload,
-                                    immediateSwitchTracker.attemptedAuthIndices,
-                                    proxyRequest.request_id
+                                    proxyRequest.request_id,
+                                    immediateSwitchTracker
                                 );
                                 const nextIndex = this.accountRequestContext.getLease()?.authIndex;
                                 if (moved && Number.isInteger(nextIndex) && nextIndex !== currentQueueAuthIndex) {
@@ -4345,21 +4362,17 @@ class RequestHandler {
                     continue;
                 }
                 const isStallTimeoutStatus = errorStatus === 504;
-                if (
-                    this.config.accountLoadBalancing &&
-                    this.accountRequestContext.getLease() &&
-                    isStallTimeoutStatus &&
-                    retryAttempt < this.config.maxRetries
-                ) {
+                if (this.config.accountLoadBalancing && this.accountRequestContext.getLease() && isStallTimeoutStatus) {
                     try {
                         // PATCH(upload-affinity): 粘性请求不能换号，直接在原账号上重试。
                         const isPinnedRequest = this._isPinnedRequest(immediateSwitchTracker);
                         const moved = isPinnedRequest
                             ? false
-                            : await this._moveCurrentAccountLease(
+                            : await this._prepareImmediateStatusRetry(
                                   errorPayload,
-                                  immediateSwitchTracker.attemptedAuthIndices,
-                                  proxyRequest.request_id
+                                  proxyRequest.request_id,
+                                  immediateSwitchTracker,
+                                  currentQueueAuthIndex
                               );
                         if (moved || isPinnedRequest) {
                             const newAuthIndex = isPinnedRequest
@@ -4379,6 +4392,8 @@ class RequestHandler {
                                 continue;
                             }
                         }
+                        lastError = { ...errorPayload, skipAccountSwitch: true };
+                        break;
                     } catch (moveError) {
                         this.logger.warn(
                             `[LoadBalancer] Unable to switch to another account after stall on #${currentQueueAuthIndex}: ${moveError.message}`

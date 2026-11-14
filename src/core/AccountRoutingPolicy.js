@@ -51,8 +51,9 @@ class AccountRoutingPolicy {
         );
         fs.renameSync(p, this.path);
     }
-    targets(indices) {
-        const list = this.order(indices);
+    targets(indices, preferred = null) {
+        let list = this.order(indices);
+        if (preferred) list = [...list.filter(preferred), ...list.filter(i => !preferred(i))];
         const paid = list
             .filter(i => this.group(i) === "paid")
             .slice(0, this.settings.paidActive + this.settings.paidStandby);

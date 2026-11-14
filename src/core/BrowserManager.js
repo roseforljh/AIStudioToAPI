@@ -2218,11 +2218,28 @@ class BrowserManager {
         }
     }
 
+    prioritizeRetryCandidates(requestId, allowed) {
+        this._retryCandidates ||= new Map();
+        this._retryCandidates.set(requestId, allowed);
+        this._scheduleDeprioritizeRebuild();
+        return () => {
+            if (this._retryCandidates.get(requestId) !== allowed) return;
+            this._retryCandidates.delete(requestId);
+        };
+    }
+
     async _rebalanceStablePool() {
         const rotation = this.authSource.getRotationIndices();
         const valid = new Set(rotation);
+        const retries = [...(this._retryCandidates?.values() || [])];
+        const preferred = retries.length ? i => retries.some(allowed => allowed(i)) : null;
         const targetSet = this.accountRoutingPolicy
-            ? new Set(this.accountRoutingPolicy.targets(rotation.filter(i => !this._isAccountUnavailable(i))))
+            ? new Set(
+                  this.accountRoutingPolicy.targets(
+                      rotation.filter(i => !this._isAccountUnavailable(i)),
+                      preferred
+                  )
+              )
             : null;
         const stale = [...this.contexts.keys()].filter(
             i =>
