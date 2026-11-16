@@ -2119,7 +2119,11 @@ class BrowserManager {
      * The remaining warm contexts stay as hot standby and are NOT called.
      */
     selectActiveAuthIndices(readyIndices) {
-        if (this._manualSwitchInProgress) return [];
+        if (this._manualSwitchInProgress) {
+            return (this._manualSwitchActiveIndices || []).filter(
+                i => (readyIndices || []).includes(i) && !this._isAccountUnavailable(i)
+            );
+        }
         if (this.config.accountLoadBalancing && this.accountRoutingPolicy) {
             return this.accountRoutingPolicy.choose(readyIndices || [], index => this._isAccountUnavailable(index));
         }
@@ -2724,7 +2728,11 @@ class BrowserManager {
                         }
 
                         // Stop background tasks for old context
-                        if (this._currentAuthIndex >= 0 && this.contexts.has(this._currentAuthIndex)) {
+                        if (
+                            !this.config.accountLoadBalancing &&
+                            this._currentAuthIndex >= 0 &&
+                            this.contexts.has(this._currentAuthIndex)
+                        ) {
                             const oldContextData = this.contexts.get(this._currentAuthIndex);
                             if (oldContextData.healthMonitorInterval) {
                                 clearInterval(oldContextData.healthMonitorInterval);
@@ -2778,7 +2786,11 @@ class BrowserManager {
 
         try {
             // Stop background tasks for old context
-            if (this._currentAuthIndex >= 0 && this.contexts.has(this._currentAuthIndex)) {
+            if (
+                !this.config.accountLoadBalancing &&
+                this._currentAuthIndex >= 0 &&
+                this.contexts.has(this._currentAuthIndex)
+            ) {
                 const oldContextData = this.contexts.get(this._currentAuthIndex);
                 if (oldContextData.healthMonitorInterval) {
                     clearInterval(oldContextData.healthMonitorInterval);
@@ -3151,8 +3163,20 @@ class BrowserManager {
             return;
         }
         if (this._manualSwitchInProgress) throw new Error("Account switch already in progress");
-        const previousIndex = this._currentAuthIndex;
-        // Gate admissions and backfill before the first await; manual switching explicitly closes the old account.
+        const active = this.config.accountLoadBalancing ? this.getActiveCallableIndices() : [];
+        if (active.includes(newAuthIndex)) return; // Already participating; do not evict another active account.
+        const previousIndex = this.config.accountLoadBalancing
+            ? (active
+                  .filter(
+                      i =>
+                          !this.accountRoutingPolicy ||
+                          this.accountRoutingPolicy.group(i) === this.accountRoutingPolicy.group(newAuthIndex)
+                  )
+                  .sort((a, b) => a - b)[0] ?? -1)
+            : this._currentAuthIndex;
+        const previousPointer = this._currentAuthIndex;
+        // Keep unrelated active accounts callable while this slot is replaced.
+        this._manualSwitchActiveIndices = active.filter(i => i !== previousIndex);
         this._manualSwitchInProgress = true;
         try {
             await this._poolRebalanceTask;
@@ -3174,9 +3198,10 @@ class BrowserManager {
             this._poolActive.add(newAuthIndex);
             this.logger.info(`✅ [Browser] Account switch completed, current account: ${this._currentAuthIndex}`);
         } catch (error) {
-            if (previousIndex >= 0 && this._currentAuthIndex !== previousIndex) {
+            const restoreIndex = previousIndex >= 0 ? previousIndex : previousPointer;
+            if (restoreIndex >= 0 && this._currentAuthIndex !== restoreIndex) {
                 try {
-                    await this.launchOrSwitchContext(previousIndex);
+                    await this.launchOrSwitchContext(restoreIndex);
                 } catch (restoreError) {
                     this.logger.error(`[Browser] Could not restore previous account: ${restoreError.message}`);
                 }
@@ -3184,6 +3209,7 @@ class BrowserManager {
             throw error;
         } finally {
             this._manualSwitchInProgress = false;
+            this._manualSwitchActiveIndices = null;
             this.contextMaintenance?.notifyAvailabilityChanged();
         }
     }

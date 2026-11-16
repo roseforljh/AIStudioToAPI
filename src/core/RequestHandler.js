@@ -1190,6 +1190,16 @@ class RequestHandler {
     async _ensureBrowserBackedRequestReady(res, options = {}) {
         const { logPrefix = "Request", waitErrorType = null, waitOptions } = options;
 
+        // Replacing one pool slot must not block requests on the other healthy slots.
+        if (
+            this.config.accountLoadBalancing &&
+            this.browserManager?._manualSwitchInProgress &&
+            this.browserManager.getActiveCallableIndices().length > 0
+        ) {
+            this.browserManager.notifyUserActivity();
+            return true;
+        }
+
         // Check current account's browser connection
         if (!this.connectionRegistry.getConnectionByAuth(this.currentAuthIndex)) {
             this.logger.warn(`[${logPrefix}] No WebSocket connection for current account #${this.currentAuthIndex}`);

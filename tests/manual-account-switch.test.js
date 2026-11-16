@@ -43,6 +43,9 @@ function fixture() {
         b.contexts.set(i, {});
         b._currentAuthIndex = i;
     };
+    b.connectionRegistry = {
+        getAllConnections: () => new Map([...b.contexts.keys()].map(i => [i, { readyState: 1 }])),
+    };
     b.contextMaintenance = new Balancer({
         getEligibleAuthIndices: () => b.selectActiveAuthIndices([...b.contexts.keys()]),
     });
@@ -116,4 +119,122 @@ test("manual account API path delegates replacement once and resets its busy fla
     assert.deepEqual(await auth.switchToSpecificAuth(1), { newIndex: 1, success: true });
     assert.deepEqual(calls, [[1, { replaceCurrent: true }]]);
     assert.equal(auth.isSystemBusy, false);
+});
+
+test("manual pool switch replaces the first active slot in its own group, not the legacy pointer", async () => {
+    const { b, policy, events } = fixture();
+    b.config.maxContexts = 6;
+    b.contexts = new Map([0, 1, 2, 10, 11, 12].map(i => [i, {}]));
+    b._currentAuthIndex = 11;
+    b.authSource.getRotationIndices = () => [0, 1, 2, 10, 11, 12];
+    policy.settings = { normalActive: 2, normalStandby: 1, paidActive: 2, paidStandby: 1 };
+    policy.scanner = { get: i => ({ state: i >= 10 ? "ready-paid" : "ready-free" }) };
+    b.preCleanupForSwitch = async () => events.push("cleanup");
+    let release;
+    b._poolRebalanceTask = new Promise(resolve => {
+        release = resolve;
+    });
+    const switching = b.switchAccount(2, { replaceCurrent: true });
+    assert.deepEqual(
+        b.getActiveCallableIndices().sort((a, c) => a - c),
+        [1, 10, 11],
+        "other slots remain callable"
+    );
+    assert.deepEqual(b.selectActiveAuthIndices([1, 12]), [1], "allowed filters cannot admit a standby mid-switch");
+    release();
+    await switching;
+    assert.deepEqual(events, ["abort", "save:0", "close:0", "cleanup", "open:2"]);
+    assert.deepEqual(
+        b.getActiveCallableIndices().sort((a, c) => a - c),
+        [1, 2, 10, 11]
+    );
+    assert.equal(b.contexts.has(0), false);
+    assert.equal(b.contexts.has(11), true, "legacy pointer is not the replacement slot");
+    assert.equal(b.currentAuthIndex, 2);
+    assert.deepEqual(policy.settings, { normalActive: 2, normalStandby: 1, paidActive: 2, paidStandby: 1 });
+});
+
+test("selecting an already active pool account never evicts another active account", async () => {
+    const { b, events, policy } = fixture();
+    policy.settings.normalActive = 2;
+    await b.switchAccount(1, { replaceCurrent: true });
+    assert.deepEqual(events, []);
+    assert.deepEqual(b.getActiveCallableIndices(), [0, 1]);
+});
+
+test("failed slot replacement restores pool capacity without touching other active slots", async () => {
+    const { b, policy } = fixture();
+    b.contexts.set(3, {});
+    b.authSource.getRotationIndices = () => [0, 1, 2, 3];
+    policy.settings.normalActive = 2;
+    b.preCleanupForSwitch = async () => {};
+    b.launchOrSwitchContext = async i => {
+        if (i === 2) throw new Error("expired");
+        b.contexts.set(i, {});
+        b._currentAuthIndex = i;
+    };
+    await assert.rejects(b.switchAccount(2, { replaceCurrent: true }), /expired/);
+    assert.deepEqual(b.getActiveCallableIndices(), [0, 1]);
+    assert.equal(b.contexts.has(1), true);
+});
+
+test("other healthy pool slots bypass the single-account readiness gate during replacement", async () => {
+    const RequestHandler = require("../src/core/RequestHandler");
+    let activity = 0;
+    const handler = {
+        browserManager: {
+            _manualSwitchInProgress: true,
+            getActiveCallableIndices: () => [1, 2],
+            notifyUserActivity: () => activity++,
+        },
+        config: { accountLoadBalancing: true },
+        connectionRegistry: {
+            getConnectionByAuth: () => {
+                throw new Error("must not use the closed legacy pointer");
+            },
+        },
+    };
+    assert.equal(await RequestHandler.prototype._ensureBrowserBackedRequestReady.call(handler, {}), true);
+    assert.equal(activity, 1);
+});
+
+test("multiple unaffected accounts keep accepting load-balanced requests while a slot is replaced", async () => {
+    const { b, policy } = fixture();
+    b.config.maxContexts = 5;
+    b.contexts = new Map([0, 1, 2, 3, 4].map(i => [i, {}]));
+    b.authSource.getRotationIndices = () => [0, 1, 2, 3, 4, 5];
+    policy.settings.normalActive = 3;
+    b.preCleanupForSwitch = async () => {};
+    b.contextMaintenance.maxConcurrentRequests = n => n;
+    let release;
+    b._poolRebalanceTask = new Promise(resolve => {
+        release = resolve;
+    });
+    const switching = b.switchAccount(5, { replaceCurrent: true });
+    try {
+        const first = await b.contextMaintenance.acquire();
+        const second = await b.contextMaintenance.acquire();
+        assert.deepEqual(
+            [first.authIndex, second.authIndex].sort((a, c) => a - c),
+            [1, 2]
+        );
+        first.release();
+        second.release();
+    } finally {
+        release();
+        await switching;
+    }
+    assert.deepEqual(
+        b.getActiveCallableIndices().sort((a, c) => a - c),
+        [1, 2, 5]
+    );
+});
+
+test("single-account mode still replaces the legacy current account", async () => {
+    const { b, events } = fixture();
+    b.config.accountLoadBalancing = false;
+    await b.switchAccount(2, { replaceCurrent: true });
+    assert.deepEqual(events, ["abort", "save:0", "close:0", "cleanup", "open:2"]);
+    assert.equal(b.contexts.has(0), false);
+    assert.equal(b.currentAuthIndex, 2);
 });

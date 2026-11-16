@@ -355,7 +355,7 @@
                                 class="account-list-item"
                                 style="cursor: pointer"
                                 :class="{
-                                    'is-current': item.index === state.currentAuthIndex,
+                                    'is-current': state.accountLoadBalancingEnabled ? item.isActive : item.index === state.currentAuthIndex,
                                     'is-selected': isAccountSelected(item.index),
                                 }"
                                 @click="toggleSelectAccount(item.index)"
@@ -381,10 +381,9 @@
                                         >
                                             {{ getAccountDisplayName(item) }}
                                         </span>
-                                        <span v-if="item.index === state.currentAuthIndex" class="current-badge">
-                                            {{ t("tagCurrent") }}
+                                        <span v-if="state.accountLoadBalancingEnabled ? item.isActive : item.index === state.currentAuthIndex" class="current-badge">
+                                            {{ state.accountLoadBalancingEnabled ? (state.currentLang === "zh" ? "当前·活跃" : "Current · Active") : t("tagCurrent") }}
                                         </span>
-                                        <span v-if="state.accountLoadBalancingEnabled && item.isActive && item.index !== state.currentAuthIndex" class="standby-badge">{{ state.currentLang === 'zh' ? '活跃' : 'Active' }}</span>
                                         <span v-if="state.accountLoadBalancingEnabled && item.isStandby" class="standby-badge">{{ state.currentLang === 'zh' ? '预备' : 'Standby' }}</span>
                                         <span v-if="item.benefitState === 'ready-paid'" class="benefit-paid">{{ state.currentLang === 'zh' ? '付费权益' : 'Paid benefit' }}</span>
                                         <span v-else-if="item.benefitState === 'ready-free'" class="benefit-free">{{ state.currentLang === 'zh' ? '普通' : 'Standard' }}</span>
@@ -402,12 +401,12 @@
                                     <button
                                         class="btn-switch"
                                         :class="{
-                                            'is-active': item.index === state.currentAuthIndex,
+                                            'is-active': state.accountLoadBalancingEnabled ? item.isActive : item.index === state.currentAuthIndex,
                                             'is-fast': state.accountLoadBalancingEnabled ? item.isStandby : item.isReady && item.index !== state.currentAuthIndex,
                                         }"
-                                        :disabled="isBusy || (item.index === state.currentAuthIndex)"
+                                        :disabled="isBusy || (state.accountLoadBalancingEnabled ? item.isActive : item.index === state.currentAuthIndex)"
                                         :title="
-                                            (item.index === state.currentAuthIndex)
+                                            (state.accountLoadBalancingEnabled ? item.isActive : item.index === state.currentAuthIndex)
                                                 ? t('currentAccount')
                                                 : item.hasContext
                                                   ? t('fastSwitch')
@@ -416,7 +415,7 @@
                                         @click.stop="switchAccountByIndex(item.index)"
                                     >
                                         <svg
-                                            v-if="!(item.index === state.currentAuthIndex)"
+                                            v-if="!(state.accountLoadBalancingEnabled ? item.isActive : item.index === state.currentAuthIndex)"
                                             xmlns="http://www.w3.org/2000/svg"
                                             width="16"
                                             height="16"
@@ -1957,17 +1956,22 @@ const handleStreamingModeBeforeChange = async () => {
 
 // Switch account by index
 const switchAccountByIndex = targetIndex => {
-    if (state.currentAuthIndex === targetIndex) {
+    const targetAccount = state.accountDetails.find(acc => acc.index === targetIndex);
+    if (state.accountLoadBalancingEnabled ? targetAccount?.isActive : state.currentAuthIndex === targetIndex) {
         ElMessage.warning(t("alreadyCurrentAccount"));
         return;
     }
 
-    const targetAccount = state.accountDetails.find(acc => acc.index === targetIndex);
     const accountSuffix = targetAccount ? ` (${getAccountDisplayName(targetAccount)})` : "";
 
+    const previousAccount = state.accountLoadBalancingEnabled
+        ? state.accountDetails
+            .filter(acc => acc.isActive && (acc.benefitState === "ready-paid") === (targetAccount?.benefitState === "ready-paid"))
+            .sort((a, b) => a.index - b.index)[0]
+        : state.accountDetails.find(acc => acc.index === state.currentAuthIndex);
     const switchWarning = state.currentLang === "zh"
-        ? "原当前账号会关闭；若有正在进行的请求，该请求会中断。"
-        : "The previous current account will close; any request on it will be interrupted.";
+        ? `${previousAccount ? `将关闭账号 #${previousAccount.index} 并替换为所选账号；该账号正在执行的请求会中断。` : "将启用所选账号。"}${state.accountLoadBalancingEnabled ? "其他活跃账号继续参与负载均衡。" : ""}`
+        : `${previousAccount ? `Account #${previousAccount.index} will close and be replaced; requests on it will be interrupted.` : "The selected account will be activated."}${state.accountLoadBalancingEnabled ? " Other active accounts remain in load balancing." : ""}`;
     ElMessageBox.confirm(`${t("confirmSwitch")} #${targetIndex}${accountSuffix}? ${switchWarning}`, {
         cancelButtonText: t("cancel"),
         confirmButtonText: t("ok"),
