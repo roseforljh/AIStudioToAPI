@@ -75,6 +75,15 @@ class AccountRoutingPolicy {
         ];
         return [...selected, ...list.filter(i => !selected.includes(i))];
     }
+    promote(index, previousIndex, indices) {
+        const valid = new Set(indices);
+        const rest = [...new Set([...(this.rotation || []), ...indices])].filter(
+            i => valid.has(i) && i !== index && i !== previousIndex
+        );
+        this.rotation = [index, ...rest];
+        if (previousIndex !== index && valid.has(previousIndex)) this.rotation.push(previousIndex);
+        this.persist();
+    }
     retire(index, indices) {
         const valid = new Set(indices.filter(i => Number.isInteger(i) && i >= 0));
         this.rotation = [...new Set([...(this.rotation || []), ...[...valid].sort((a, b) => a - b)])].filter(

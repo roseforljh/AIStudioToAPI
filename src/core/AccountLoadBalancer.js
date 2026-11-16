@@ -160,6 +160,12 @@ class AccountLoadBalancer {
         return Math.max(1, Math.floor(eligibleCount / 2));
     }
 
+    resetCooldown(authIndex) {
+        const state = this._getState(authIndex);
+        state.cooldownUntil = 0;
+        state.consecutiveCooldowns = 0;
+    }
+
     isCoolingDown(authIndex) {
         try {
             const state = this._getState(authIndex);

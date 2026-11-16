@@ -2119,6 +2119,7 @@ class BrowserManager {
      * The remaining warm contexts stay as hot standby and are NOT called.
      */
     selectActiveAuthIndices(readyIndices) {
+        if (this._manualSwitchInProgress) return [];
         if (this.config.accountLoadBalancing && this.accountRoutingPolicy) {
             return this.accountRoutingPolicy.choose(readyIndices || [], index => this._isAccountUnavailable(index));
         }
@@ -2198,7 +2199,7 @@ class BrowserManager {
      * Removes excess contexts and starts missing ones in background
      */
     async rebalanceContextPool() {
-        if (this._memoryMaintenance) return;
+        if (this._memoryMaintenance || this._manualSwitchInProgress) return;
         if (!this.config.accountLoadBalancing) return this._rebalanceContextPoolLegacy();
         if (this._poolRebalanceTask) {
             this._poolRebalanceAgain = true;
@@ -3143,10 +3144,48 @@ class BrowserManager {
         this.isClosingIntentionally = false;
     }
 
-    async switchAccount(newAuthIndex) {
+    async switchAccount(newAuthIndex, { replaceCurrent = false } = {}) {
         this.logger.info(`🔄 [Browser] Starting account switch: from ${this._currentAuthIndex} to ${newAuthIndex}`);
-        await this.launchOrSwitchContext(newAuthIndex);
-        this.logger.info(`✅ [Browser] Account switch completed, current account: ${this._currentAuthIndex}`);
+        if (!replaceCurrent) {
+            await this.launchOrSwitchContext(newAuthIndex);
+            return;
+        }
+        if (this._manualSwitchInProgress) throw new Error("Account switch already in progress");
+        const previousIndex = this._currentAuthIndex;
+        // Gate admissions and backfill before the first await; manual switching explicitly closes the old account.
+        this._manualSwitchInProgress = true;
+        try {
+            await this._poolRebalanceTask;
+            await this.abortBackgroundPreload();
+            if (previousIndex >= 0 && previousIndex !== newAuthIndex) {
+                try {
+                    await this._updateAuthFile(previousIndex);
+                } catch (error) {
+                    this.logger.warn(`[Browser] Failed to save old auth during switch: ${error.message}`);
+                }
+                await this.closeContext(previousIndex);
+            }
+            await this.preCleanupForSwitch(newAuthIndex);
+            this._deprioritizedUntil.delete(newAuthIndex);
+            this.contextMaintenance?.resetCooldown(newAuthIndex);
+            await this.launchOrSwitchContext(newAuthIndex);
+            this.accountRoutingPolicy?.promote(newAuthIndex, previousIndex, this.authSource.getRotationIndices());
+            this._poolActive.delete(previousIndex);
+            this._poolActive.add(newAuthIndex);
+            this.logger.info(`✅ [Browser] Account switch completed, current account: ${this._currentAuthIndex}`);
+        } catch (error) {
+            if (previousIndex >= 0 && this._currentAuthIndex !== previousIndex) {
+                try {
+                    await this.launchOrSwitchContext(previousIndex);
+                } catch (restoreError) {
+                    this.logger.error(`[Browser] Could not restore previous account: ${restoreError.message}`);
+                }
+            }
+            throw error;
+        } finally {
+            this._manualSwitchInProgress = false;
+            this.contextMaintenance?.notifyAvailabilityChanged();
+        }
     }
 }
 

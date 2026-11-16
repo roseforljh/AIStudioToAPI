@@ -226,9 +226,7 @@ class AuthSwitcher {
         this.isSystemBusy = true;
         try {
             this.logger.info(`🔄 [Auth] Starting switch to specified account #${targetIndex}...`);
-            // Pre-cleanup: remove excess contexts BEFORE creating new one to avoid exceeding maxContexts
-            await this.browserManager.preCleanupForSwitch(targetIndex);
-            await this.browserManager.switchAccount(targetIndex);
+            await this.browserManager.switchAccount(targetIndex, { replaceCurrent: true });
             this.resetCounters();
             this.browserManager.rebalanceContextPool().catch(err => {
                 this.logger.error(`[Auth] Background rebalance failed: ${err.message}`);
